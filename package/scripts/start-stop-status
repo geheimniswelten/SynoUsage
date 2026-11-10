@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+var="${SYNOPKG_PKGVAR:-/var/packages/h5uSynoUsage/var}"
+case "${1:-}" in
+  start) mkdir -p "$var"; : > "$var/enabled" ;;
+  stop) rm -f "$var/enabled" ;;
+  status) test -f "$var/enabled" || exit 3 ;;
+  prestart|prestop) exit 0 ;;
+  *) echo "Usage: $0 {start|stop|status}" >&2; exit 1 ;;
+esac

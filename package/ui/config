@@ -1,0 +1,15 @@
+{
+  "SynoUsage.js": {
+    "SYNO.SDS.h5uSynoUsage.Application": {
+      "type": "app", "title": "SynoUsage",
+      "appWindow": "SYNO.SDS.h5uSynoUsage.MainWindow",
+      "icon": "images/icon_{0}.png", "allowMultiInstance": false,
+      "allowStandalone": false, "allowSharing": false,
+      "allUsers": false, "grantPrivilege": "local", "advanceGrantPrivilege": true,
+      "depend": ["SYNO.SDS.h5uSynoUsage.MainWindow"]
+    },
+    "SYNO.SDS.h5uSynoUsage.MainWindow": {
+      "type": "lib", "title": "SynoUsage", "icon": "images/icon_{0}.png"
+    }
+  }
+}

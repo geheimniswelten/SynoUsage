@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>SynoUsage</title>
+    <link rel="stylesheet" href="assets/synousage.css" />
+  </head>
+  <body id="synousage-app">
+    <div class="shell">
+      <header class="header">
+        <div class="brand-icon"><img src="assets/synousage.svg" alt="" /></div>
+        <div class="brand">
+          <h1>SynoUsage</h1>
+          <p>Speicherbelegung und Verlauf</p>
+        </div>
+        <span id="demo-badge" class="badge demo" hidden>DEMO-DATEN</span
+        ><button
+          id="connection"
+          class="connection"
+          title="Erfassungsstatus öffnen"
+        >
+          ● Verbindung wird aufgebaut</button
+        ><button
+          id="settings-open"
+          class="icon-button"
+          aria-label="Einstellungen"
+          title="Einstellungen"
+        >
+          ⚙
+        </button>
+      </header>
+      <div class="workspace">
+        <aside class="rail">
+          <nav aria-label="Ansichten">
+            <button class="nav active" data-page="current">
+              <span>▦</span> Aktuell</button
+            ><button class="nav" data-page="history">
+              <span>◷</span> Verlauf</button
+            ><button class="nav" data-page="details">
+              <span>☷</span> Details
+            </button>
+          </nav>
+          <div class="rail-bottom">
+            <button id="refresh" class="button primary">
+              ↻ &nbsp;Daten aktualisieren
+            </button>
+            <p id="rail-status">Noch keine Erhebung</p>
+          </div>
+        </aside>
+        <main>
+          <div id="notice" class="notice" hidden></div>
+          <div class="topline">
+            <div>
+              <h2 id="page-title">Speicherübersicht</h2>
+              <p id="page-subtitle">Kapazität und größte Speicherposten</p>
+            </div>
+            <label class="select-label"
+              >Volume
+              <select id="volume-filter" aria-label="Volume auswählen"></select
+            ></label>
+          </div>
+          <div id="content"></div>
+        </main>
+      </div>
+      <footer><span>SynoUsage</span><span id="footer-info"></span></footer>
+    </div>
+    <dialog id="settings">
+      <div class="dialog-head">
+        <div>
+          <div class="eyebrow">PERSÖNLICH &amp; SYSTEM</div>
+          <h2>Einstellungen</h2>
+        </div>
+        <button class="icon-button" id="settings-close" aria-label="Schließen">
+          ×
+        </button>
+      </div>
+      <div class="settings-grid">
+        <label
+          >Startansicht<select id="start-view">
+            <option value="last">Zuletzt gewähltes Volume</option>
+            <option value="all">Alle Volumes</option>
+            <option value="volume">Bestimmtes Volume</option>
+          </select></label
+        ><label id="start-volume-label"
+          >Start-Volume<select id="start-volume"></select></label
+        ><label
+          >Diagramm<select id="chart-mode">
+            <option value="bar">Balken</option>
+            <option value="donut">Torte</option>
+          </select></label
+        ><label
+          >Freier Speicher im Diagramm<select id="free-mode">
+            <option value="auto">Automatisch</option>
+            <option value="show">Anzeigen</option>
+            <option value="hide">Ausblenden</option>
+          </select></label
+        ><label class="check"
+          ><input type="checkbox" id="mini-bars" /> Kleine Balken in
+          Einträgen</label
+        ><label class="check"
+          ><input type="checkbox" id="subdivide" /> Einzelposten im Diagramm
+          unterteilen</label
+        >
+      </div>
+      <p class="hint">
+        Automatisch blendet freien Speicher nur bei ausgewähltem Eintrag aus.
+        Die Kennzahl bleibt sichtbar. Einstellungen gelten für diesen Browser.
+      </p>
+      <div class="settings-section">
+        <h3>Datenerhebung</h3>
+        <p id="task-status" class="hint" role="status">
+          Aufgabe wird geprüft …
+        </p>
+        <div class="button-row">
+          <button id="task-register" class="button secondary" hidden>
+            Aufgabe registrieren</button
+          ><button id="task-update" class="button secondary" hidden>
+            Aufgabe aktualisieren</button
+          ><button id="task-scheduler" class="button quiet">
+            Aufgabenplaner öffnen ↗
+          </button>
+        </div>
+        <p class="hint">
+          Die regelmäßige Erhebung wird über den DSM-Aufgabenplaner verwaltet.
+        </p>
+        <details id="task-script" hidden>
+          <summary>Skript für manuelle Registrierung</summary>
+          <p class="hint">
+            Im Aufgabenplaner als benutzerdefiniertes Skript „SynoUsage
+            Erfassung“ unter root anlegen.
+          </p>
+          <textarea
+            id="task-command"
+            aria-label="Erfassungsskript"
+            readonly
+            rows="7"
+            spellcheck="false"
+          ></textarea>
+        </details>
+      </div>
+      <div class="dialog-actions">
+        <button id="settings-done" class="button primary">Fertig</button>
+      </div>
+    </dialog>
+    <dialog id="run-dialog">
+      <div class="dialog-head">
+        <h2>Erfassungsstatus</h2>
+        <button class="icon-button" id="run-close" aria-label="Schließen">
+          ×
+        </button>
+      </div>
+      <p id="run-phase" role="status"></p>
+      <pre id="run-log"></pre>
+      <pre id="run-warnings" hidden></pre>
+    </dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <script defer src="demo.js"></script>
+    <script defer src="task-build.js"></script>
+    <script defer src="dsm.js"></script>
+    <script defer src="app.js"></script>
+  </body>
+</html>
