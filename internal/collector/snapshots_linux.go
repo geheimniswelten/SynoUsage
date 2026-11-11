@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"synousage/internal/model"
@@ -15,6 +16,9 @@ import (
 )
 
 const btrfsTimeout = 20 * time.Second
+
+const snapshotDataMetric = "btrfs_snapshot_data"
+const snapshotLowerBoundMetric = "btrfs_qgroup_exclusive_lower_bound"
 
 type subvolume struct {
 	id               uint64
@@ -24,65 +28,308 @@ type subvolume struct {
 
 type qgroup struct{ referenced, exclusive uint64 }
 
-func snapshotItems(ctx context.Context, volume mount, items []model.Item) ([]model.Item, []string) {
+type snapshotInventory struct {
+	binary string
+	subs   []subvolume
+	paths  map[string]bool
+}
+
+type snapshotRef struct {
+	id                    uint64
+	sourceKey, sourcePath string
+	sourceName            string
+}
+
+func discoverSnapshots(ctx context.Context, volume mount) (snapshotInventory, error) {
 	binary := btrfsBinary()
 	if binary == "" {
-		return nil, []string{volume.path + ": Btrfs-Snapshots konnten nicht ermittelt werden (Befehl btrfs fehlt)"}
+		return snapshotInventory{}, errors.New("Befehl btrfs fehlt")
 	}
 	output, err := runBtrfs(ctx, binary, "subvolume", "list", "-a", "-u", "-q", volume.path)
 	if err != nil {
-		return nil, []string{fmt.Sprintf("%s: Btrfs-Snapshots konnten nicht ermittelt werden (%v)", volume.path, err)}
+		return snapshotInventory{}, err
 	}
 	subvolumes, err := parseSubvolumes(output, volume)
 	if err != nil {
-		return nil, []string{fmt.Sprintf("%s: Btrfs-Snapshots konnten nicht ermittelt werden (%v)", volume.path, err)}
+		return snapshotInventory{}, err
 	}
-	snapshots, ids := associateSnapshots(volume, items, subvolumes)
-	if len(snapshots) == 0 {
-		return nil, nil
-	}
-	output, err = runBtrfs(ctx, binary, "qgroup", "show", "--raw", volume.path)
-	var groups map[uint64]qgroup
+	scope, cancel := context.WithTimeout(ctx, btrfsTimeout)
+	defer cancel()
+	var roots map[uint64]btrfsRoot
+	dir, err := openDirectory(volume.path)
 	if err == nil {
-		groups, err = parseQgroups(output)
+		defer dir.Close()
+		reader := btrfsTreeReader{file: dir, buf: make([]byte, btrfsSearchBufferSize)}
+		roots, err = reader.activeRoots(scope)
 	}
-	summary := applySnapshotQuotas(volume.path, snapshots, ids, groups)
-	attachSnapshotSizes(items, snapshots)
-	snapshots = append([]model.Item{summary}, snapshots...)
 	if err != nil {
-		return snapshots, []string{fmt.Sprintf("%s: Btrfs-Snapshotgrößen konnten nicht ermittelt werden (%v)", volume.path, err)}
+		roots = nil
+		err = fmt.Errorf("Btrfs-Subvolume-Flags konnten nicht gelesen werden (%w)", err)
 	}
-	return snapshots, nil
+	return snapshotInventory{binary: binary, subs: subvolumes, paths: snapshotPaths(volume.path, subvolumes, roots)}, err
 }
 
-func attachSnapshotSizes(items, snapshots []model.Item) {
+func snapshotPaths(volume string, subs []subvolume, roots map[uint64]btrfsRoot) map[string]bool {
+	paths := make(map[string]bool)
+	deleted := path.Join(volume, "@deleted_subvol")
+	for _, sub := range subs {
+		if sub.path == deleted || below(deleted, sub.path) || dockerLayerSubvolume(volume, sub.path) {
+			continue
+		}
+		readOnly := roots[sub.id].flags&btrfsRootReadOnly != 0
+		managed := managedSnapshotPath(volume, sub.path)
+		if (managed && (sub.parentUUID != "-" || readOnly)) || (readOnly && sub.parentUUID != "-") {
+			paths[sub.path] = true
+		}
+	}
+	return paths
+}
+
+func managedSnapshotPath(volume, p string) bool {
+	return below(path.Join(volume, "@sharesnap"), p) || below(path.Join(volume, "@iSCSI/Snapshot"), p)
+}
+
+func dockerLayerSubvolume(volume, p string) bool {
+	parent := path.Dir(p)
+	if parent == path.Join(volume, "@docker/btrfs/subvolumes") {
+		return true
+	}
+	if path.Base(path.Dir(parent)) == "io.containerd.snapshotter.v1.btrfs" {
+		switch path.Base(parent) {
+		case "active", "snapshots", "view":
+			return true
+		}
+	}
+	return false
+}
+
+func snapshotItems(ctx context.Context, volume mount, items []model.Item, inventory snapshotInventory) ([]model.Item, []string) {
+	snapshots, refs := associateSnapshots(volume, items, inventory.subs, inventory.paths)
+	deletedPath := path.Join(volume.path, "@deleted_subvol")
+	var deleted *model.Item
+	for i := range items {
+		if items[i].Path == deletedPath {
+			deleted = &items[i]
+			break
+		}
+	}
+	var deletedSubs []subvolume
+	if deleted != nil {
+		for _, sub := range inventory.subs {
+			if below(deletedPath, sub.path) {
+				deletedSubs = append(deletedSubs, sub)
+			}
+		}
+	}
+	if len(snapshots) == 0 && len(deletedSubs) == 0 {
+		if deleted != nil && inventory.binary != "" {
+			deleted.Note = "Keine enthaltenen Subvolumes gefunden; Belegung nicht ermittelt."
+		}
+		return nil, nil
+	}
+
+	var data *snapshotData
+	var warnings []string
+	if len(snapshots) > 0 {
+		measured, err := snapshotDataForVolume(ctx, volume.path, snapshots, refs)
+		if err == nil {
+			data = &measured
+		} else if ctx.Err() == nil {
+			warnings = append(warnings, fmt.Sprintf("%s: Snapshot-Datenblöcke konnten nicht ermittelt werden (%v).", volume.path, err))
+		}
+	}
+	var groups map[uint64]qgroup
+	if ctx.Err() == nil && ((data == nil && len(snapshots) > 0) || len(deletedSubs) > 0) {
+		output, err := runBtrfs(ctx, inventory.binary, "qgroup", "show", "--raw", volume.path)
+		if err == nil {
+			groups, err = parseQgroups(output)
+			if err == nil && !hasExclusiveQgroup(groups) {
+				err = errors.New("keine exklusiven Qgroup-Werte verfügbar")
+				groups = nil
+			}
+		}
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: Exklusive Btrfs-Qgroup-Werte konnten nicht ermittelt werden (%v).", volume.path, err))
+		}
+	}
+	if len(snapshots) > 0 {
+		var summary model.Item
+		if data != nil {
+			summary = applySnapshotData(volume.path, snapshots, refs, data)
+		} else {
+			summary = applySnapshotQuotas(volume.path, snapshots, refs, groups)
+		}
+		sources := snapshotSources(summary, items, snapshots, refs, data)
+		snapshots = append([]model.Item{summary}, snapshots...)
+		snapshots = append(snapshots, sources...)
+	}
+	if deleted != nil && len(deletedSubs) > 0 {
+		snapshots = append(snapshots, measureDeletedSubvolumes(volume.path, deleted, deletedSubs, groups)...)
+		if deleted.MeasuredSnapshots < len(deletedSubs) {
+			warnings = append(warnings, fmt.Sprintf("%s: Exklusive Qgroup-Werte für %d von %d Subvolumes fehlen.", deletedPath, len(deletedSubs)-deleted.MeasuredSnapshots, len(deletedSubs)))
+		}
+	}
+	return snapshots, warnings
+}
+
+func snapshotDataForVolume(ctx context.Context, volume string, snapshots []model.Item, refs []snapshotRef) (snapshotData, error) {
+	scope, cancel := context.WithTimeout(ctx, retryTreeTimeout)
+	defer cancel()
+	dir, err := openDirectory(volume)
+	if err != nil {
+		return snapshotData{}, err
+	}
+	defer dir.Close()
+	reader := btrfsTreeReader{file: dir, buf: make([]byte, btrfsSearchBufferSize)}
+	roots, err := reader.activeRoots(scope)
+	if err != nil {
+		return snapshotData{}, err
+	}
+	sources := make(map[uint64]string, len(refs))
+	for i, ref := range refs {
+		if !managedSnapshotPath(volume, snapshots[i].Path) && roots[ref.id].flags&btrfsRootReadOnly == 0 {
+			return snapshotData{}, fmt.Errorf("Snapshot-Baum %d ist nicht mehr schreibgeschützt", ref.id)
+		}
+		sources[ref.id] = ref.sourceKey
+	}
+	return measureSnapshotData(scope, &reader, roots, sources, snapshotExtentsPerPass)
+}
+
+func hasExclusiveQgroup(groups map[uint64]qgroup) bool {
+	// Some DSM volumes track referenced bytes but leave every exclusive
+	// counter at zero. Full accounting includes at least the tree metadata.
+	for _, group := range groups {
+		if group.exclusive > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func measureDeletedSubvolumes(volume string, parent *model.Item, subs []subvolume, groups map[uint64]qgroup) []model.Item {
+	var total uint64
+	known := 0
+	children := make([]model.Item, 0, len(subs))
+	parent.SnapshotCount = len(subs)
+	for _, sub := range subs {
+		item := makeItem(volume, "snapshots", path.Base(sub.path), sub.path, parent.ID)
+		item.Metric = "btrfs_snapshot"
+		item.Note = "Exklusive Belegung dieses Subvolumes unbekannt."
+		if group, ok := groups[sub.id]; ok {
+			item.Bytes, item.ExclusiveBytes, item.ReferencedBytes = &group.exclusive, &group.exclusive, &group.referenced
+			item.Metric = "btrfs_qgroup_exclusive"
+			item.Note = "Exklusive Btrfs-Qgroup-Belegung dieses Subvolumes."
+			total += group.exclusive
+			known++
+		}
+		children = append(children, item)
+	}
+	parent.MeasuredSnapshots = known
+	if known > 0 {
+		parent.Bytes, parent.ExclusiveBytes = &total, &total
+		parent.Metric = snapshotLowerBoundMetric
+		parent.Note = fmt.Sprintf("Untergrenze: Summe exklusiver Qgroup-Werte für %d von %d Subvolumes. Untereinander geteilte Blöcke und andere Dateien können fehlen.", known, len(subs))
+	} else {
+		parent.Note = fmt.Sprintf("Exklusive Belegung für %d enthaltene Subvolumes unbekannt; Qgroup-Werte fehlen.", len(subs))
+	}
+	return children
+}
+
+func snapshotSources(summary model.Item, items, snapshots []model.Item, refs []snapshotRef, data *snapshotData) []model.Item {
 	parents := make(map[string]*model.Item)
 	for i := range items {
 		if items[i].SnapshotCount > 0 {
 			parents[items[i].ID] = &items[i]
 		}
 	}
-	for _, snapshot := range snapshots {
-		parent := parents[snapshot.ParentID]
-		if parent == nil || snapshot.ExclusiveBytes == nil {
-			continue
+	bySource := make(map[string]*model.Item)
+	owners := make(map[string]string)
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		ref := refs[i]
+		key := ref.sourceKey
+		source := bySource[key]
+		if source == nil {
+			row := makeItem(summary.Path, "snapshots", ref.sourceName, summary.Path+"\x00"+key, summary.ID)
+			row.Path = ref.sourcePath
+			row.Metric = snapshotLowerBoundMetric
+			source = &row
+			bySource[key] = source
+			owners[key] = snapshot.ParentID
 		}
-		if parent.SnapshotBytes == nil {
-			parent.SnapshotBytes = new(uint64)
+		source.SnapshotCount++
+		if snapshot.ExclusiveBytes != nil {
+			if source.Bytes == nil {
+				source.Bytes = new(uint64)
+			}
+			*source.Bytes += *snapshot.ExclusiveBytes
+			source.MeasuredSnapshots++
 		}
-		*parent.SnapshotBytes += *snapshot.ExclusiveBytes
-		parent.MeasuredSnapshots++
+		if snapshot.ParentID == "" {
+			snapshot.ParentID = summary.ID
+		}
 	}
+	rows := make([]model.Item, 0, len(bySource)+1)
+	for key, row := range bySource {
+		if data != nil {
+			size := data.bySource[key]
+			row.Bytes = &size
+			row.Metric = snapshotDataMetric
+			row.Note = "Datenblöcke, die nur Snapshots dieser Quelle halten."
+			if row.Path == "" {
+				row.Note = "Datenblöcke in Snapshots ohne zugeordnete Quelle."
+			}
+		}
+		if parent := parents[owners[key]]; parent != nil {
+			parent.SnapshotMetric = row.Metric
+			parent.MeasuredSnapshots += row.MeasuredSnapshots
+			if row.Bytes != nil {
+				if parent.SnapshotBytes == nil {
+					parent.SnapshotBytes = new(uint64)
+				}
+				*parent.SnapshotBytes += *row.Bytes
+			}
+		}
+		rows = append(rows, *row)
+	}
+	slices.SortFunc(rows, func(a, b model.Item) int {
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Path, b.Path)
+	})
+	if data != nil && data.shared > 0 {
+		row := makeItem(summary.Path, "snapshots", "Quellübergreifend geteilt", summary.Path+"\x00shared", summary.ID)
+		row.Path, row.Metric, row.Bytes = "", snapshotDataMetric, &data.shared
+		row.Note = "Datenblöcke, die nur Snapshots mehrerer Quellen gemeinsam halten."
+		rows = append(rows, row)
+	}
+	return rows
 }
 
-func applySnapshotQuotas(volume string, snapshots []model.Item, ids []uint64, groups map[uint64]qgroup) model.Item {
+func applySnapshotData(volume string, snapshots []model.Item, refs []snapshotRef, data *snapshotData) model.Item {
+	summary := makeItem(volume, "snapshots", "Btrfs-Snapshots", volume, "")
+	summary.Metric, summary.Bytes = snapshotDataMetric, &data.total
+	summary.SnapshotCount, summary.MeasuredSnapshots = len(snapshots), len(snapshots)
+	summary.Note = "Datenblöcke, die nur Snapshots halten, einschließlich gemeinsam gehaltener Blöcke. Dateisystem-Metadaten bleiben in der übrigen Belegung."
+	for i, ref := range refs {
+		exclusive, referenced := data.exclusive[ref.id], data.referenced[ref.id]
+		snapshot := &snapshots[i]
+		snapshot.Bytes, snapshot.ExclusiveBytes, snapshot.ReferencedBytes = &exclusive, &exclusive, &referenced
+		snapshot.Metric = snapshotDataMetric
+		snapshot.Note = "Datenblöcke, die dieser Snapshot exklusiv belegt."
+	}
+	return summary
+}
+
+func applySnapshotQuotas(volume string, snapshots []model.Item, refs []snapshotRef, groups map[uint64]qgroup) model.Item {
 	summary := makeItem(volume, "snapshots", "Btrfs-Snapshots", volume, "")
 	summary.Metric = "btrfs_snapshot"
 	summary.SnapshotCount = len(snapshots)
 	var exclusive uint64
 	known := 0
-	for i, id := range ids {
-		if group, found := groups[id]; found {
+	for i, ref := range refs {
+		if group, found := groups[ref.id]; found {
 			snapshots[i].Bytes = &group.exclusive
 			snapshots[i].ExclusiveBytes = &group.exclusive
 			snapshots[i].ReferencedBytes = &group.referenced
@@ -97,7 +344,8 @@ func applySnapshotQuotas(volume string, snapshots []model.Item, ids []uint64, gr
 	if known > 0 {
 		summary.Bytes = &exclusive
 		summary.ExclusiveBytes = &exclusive
-		summary.Metric = "btrfs_qgroup_exclusive_lower_bound"
+		summary.MeasuredSnapshots = known
+		summary.Metric = snapshotLowerBoundMetric
 		summary.Note = fmt.Sprintf("Untergrenze aus den exklusiven Qgroup-Bytes für %d von %d erkannten Snapshots.", known, len(snapshots))
 	} else {
 		summary.Note = fmt.Sprintf("Die exklusive Belegung ist für alle %d erkannten Snapshots unbekannt.", len(snapshots))
@@ -171,13 +419,22 @@ func parseSubvolumes(output []byte, volume mount) ([]subvolume, error) {
 		}
 		if treePath, marked := strings.CutPrefix(p, "<FS_TREE>/"); marked {
 			absolute := path.Clean("/" + treePath)
-			if !below(volume.root, absolute) {
+			if absolute == volume.root {
+				p = ""
+			} else if below(volume.root, absolute) {
+				p = strings.TrimPrefix(absolute, strings.TrimSuffix(volume.root, "/")+"/")
+			} else {
 				continue
 			}
-			p = strings.TrimPrefix(absolute, strings.TrimSuffix(volume.root, "/")+"/")
+		} else if root := strings.Trim(volume.root, "/"); root != "" {
+			if p == root {
+				p = ""
+			} else {
+				p = strings.TrimPrefix(p, root+"/")
+			}
 		}
 		sub.path = path.Join(volume.path, p)
-		if below(volume.path, sub.path) {
+		if sub.path == volume.path || below(volume.path, sub.path) {
 			subvolumes = append(subvolumes, sub)
 		}
 	}
@@ -207,12 +464,11 @@ func parseQgroups(output []byte) (map[uint64]qgroup, error) {
 	return groups, scan.Err()
 }
 
-func associateSnapshots(volume mount, items []model.Item, subs []subvolume) ([]model.Item, []uint64) {
+func associateSnapshots(volume mount, items []model.Item, subs []subvolume, paths map[string]bool) ([]model.Item, []snapshotRef) {
 	byPath := make(map[string]*model.Item)
 	for i := range items {
 		item := &items[i]
-		if (item.Group == "shares" || item.Group == "vmm" || item.Group == "apps" ||
-			item.Path == path.Join(volume.path, "@iSCSI")) && item.Metric != "virtual_mount" {
+		if item.Group != "snapshots" && item.Metric != "virtual_mount" {
 			byPath[item.Path] = item
 		}
 	}
@@ -223,54 +479,88 @@ func associateSnapshots(volume mount, items []model.Item, subs []subvolume) ([]m
 		}
 	}
 	var snapshots []model.Item
-	var ids []uint64
+	var refs []snapshotRef
 	for _, sub := range subs {
-		if sub.parentUUID == "-" {
+		if !paths[sub.path] {
 			continue
 		}
+		ref := snapshotRef{id: sub.id, sourceKey: sub.parentUUID, sourceName: "Quelle nicht ermittelt"}
+		if ref.sourceKey == "-" {
+			ref.sourceKey = sub.path
+		}
 		var parent *model.Item
-		if origin, found := byUUID[sub.parentUUID]; found {
-			parent = byPath[origin.path]
-			if parent == nil && origin.parentUUID == "-" {
-				for p := origin.path; below(volume.path, p); p = path.Dir(p) {
-					if parent = byPath[p]; parent != nil {
-						break
-					}
+		if origin := snapshotOrigin(sub.parentUUID, byUUID, paths); origin != "" {
+			ref.sourcePath = origin
+			for p := origin; p == volume.path || below(volume.path, p); p = path.Dir(p) {
+				if parent = byPath[p]; parent != nil {
+					break
 				}
 			}
 		}
-		if parent == nil {
-			parent = dsmSnapshotParent(volume.path, sub.path, byPath)
+		if ref.sourcePath == "" {
+			ref.sourcePath, parent = dsmSnapshotSource(volume.path, sub.path, byPath)
 		}
-		if parent == nil {
-			continue
+		if ref.sourcePath != "" {
+			ref.sourceKey = ref.sourcePath
+			ref.sourceName = path.Base(ref.sourcePath)
+			if ref.sourcePath == volume.path {
+				ref.sourceName = "Volume " + strings.TrimPrefix(path.Base(volume.path), "volume")
+			}
 		}
-		parent.SnapshotCount++
-		item := makeItem(volume.path, "snapshots", path.Base(sub.path), sub.path, parent.ID)
+		var parentID string
+		if parent != nil {
+			parent.SnapshotCount++
+			parentID = parent.ID
+			if parent.Path == ref.sourcePath {
+				ref.sourceName = parent.Name
+			} else if parent.Group == "apps" || parent.Group == "docker" || parent.Group == "vmm" {
+				ref.sourceName = parent.Name + " · " + ref.sourceName
+			}
+		}
+		item := makeItem(volume.path, "snapshots", path.Base(sub.path), sub.path, parentID)
 		item.Metric = "btrfs_snapshot"
 		item.Note = "Die exklusive Belegung dieses Btrfs-Snapshots ist unbekannt."
 		snapshots = append(snapshots, item)
-		ids = append(ids, sub.id)
+		refs = append(refs, ref)
 	}
-	return snapshots, ids
+	return snapshots, refs
 }
 
-func dsmSnapshotParent(volume, p string, byPath map[string]*model.Item) *model.Item {
+func snapshotOrigin(uuid string, byUUID map[string]subvolume, paths map[string]bool) string {
+	for range len(byUUID) {
+		origin, found := byUUID[uuid]
+		if !found {
+			return ""
+		}
+		if !paths[origin.path] {
+			return origin.path
+		}
+		uuid = origin.parentUUID
+	}
+	return ""
+}
+
+func dsmSnapshotSource(volume, p string, byPath map[string]*model.Item) (string, *model.Item) {
 	if rel, ok := strings.CutPrefix(p, volume+"/@sharesnap/"); ok {
 		if share, snapshot, ok := strings.Cut(rel, "/"); ok && snapshot != "" && !strings.Contains(snapshot, "/") {
-			if item := byPath[path.Join(volume, share)]; item != nil && item.Group == "shares" {
-				return item
+			sourcePath := path.Join(volume, share)
+			if item := byPath[sourcePath]; item != nil && item.Group == "shares" {
+				return sourcePath, item
 			}
-			return byPath[path.Join(volume, "@"+share+"@")]
+			if item := byPath[path.Join(volume, "@"+share+"@")]; item != nil {
+				return item.Path, item
+			}
+			return sourcePath, nil
 		}
 	}
 	if rel, ok := strings.CutPrefix(p, volume+"/@iSCSI/Snapshot/BLUN/"); ok {
 		if disk, snapshot, ok := strings.Cut(rel, "/"); ok && snapshot != "" && !strings.Contains(snapshot, "/") {
-			if item := byPath[path.Join(volume, "@iSCSI/LUN/VDISK_BLUN", disk)]; item != nil {
-				return item
+			sourcePath := path.Join(volume, "@iSCSI/LUN/VDISK_BLUN", disk)
+			if item := byPath[sourcePath]; item != nil {
+				return sourcePath, item
 			}
-			return byPath[path.Join(volume, "@iSCSI")]
+			return "", byPath[path.Join(volume, "@iSCSI")]
 		}
 	}
-	return nil
+	return "", nil
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"synousage/internal/model"
@@ -18,21 +19,25 @@ const (
 	maxRuns         = 120
 	maxHistoryBytes = 24 << 20
 	maxRunBytes     = 8 << 20
+	currentFile     = "current.json"
+	runStartLayout  = "20060102T150405.000000000"
 )
 
 var runFilename = regexp.MustCompile(`^\d{8}T\d{6}\.\d{9}-[a-f0-9]{12}\.json$`)
 
 type scanStatus struct {
-	State     string   `json:"state"`
-	RunID     string   `json:"runId,omitempty"`
-	Phase     string   `json:"phase,omitempty"`
-	Current   string   `json:"current,omitempty"`
-	Done      int      `json:"done"`
-	Total     int      `json:"total"`
-	StartedAt string   `json:"startedAt,omitempty"`
-	UpdatedAt string   `json:"updatedAt,omitempty"`
-	Message   string   `json:"message,omitempty"`
-	Log       []string `json:"log,omitempty"`
+	Checkpoint string   `json:"checkpoint,omitempty"`
+	CanCancel  bool     `json:"canCancel,omitempty"`
+	State      string   `json:"state"`
+	RunID      string   `json:"runId,omitempty"`
+	Phase      string   `json:"phase,omitempty"`
+	Current    string   `json:"current,omitempty"`
+	Done       int      `json:"done"`
+	Total      int      `json:"total"`
+	StartedAt  string   `json:"startedAt,omitempty"`
+	UpdatedAt  string   `json:"updatedAt,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	Log        []string `json:"log,omitempty"`
 }
 
 func readStatus(dir string) (scanStatus, error) {
@@ -51,6 +56,7 @@ func readStatus(dir string) (scanStatus, error) {
 		if err := readJSON(filepath.Join(dir, "status.json"), 256<<10, &latest); err == nil {
 			if latest.State == "running" && latest.RunID == status.RunID && latest.UpdatedAt == status.UpdatedAt {
 				latest.State = "failed"
+				latest.CanCancel = false
 				latest.Message = "Die letzte Erfassung wurde unterbrochen."
 			}
 			return latest, nil
@@ -73,6 +79,20 @@ func readJSON(path string, limit int64, value any) error {
 		return fmt.Errorf("Messdatei zu groß: %s", filepath.Base(path))
 	}
 	return json.Unmarshal(data, value)
+}
+
+func readRun(path string) (model.Run, error) {
+	var run model.Run
+	if err := readJSON(path, maxRunBytes, &run); err != nil {
+		return run, err
+	}
+	// The run ID records the UTC start time, including in older measurements.
+	stamp, _, _ := strings.Cut(run.ID, "-")
+	if start, err := time.Parse(runStartLayout, stamp); err == nil && !run.At.Before(start) {
+		seconds := int64(run.At.Sub(start) / time.Second)
+		run.DurationSeconds = &seconds
+	}
+	return run, nil
 }
 
 func runFiles(dir string) ([]os.DirEntry, error) {
@@ -112,8 +132,7 @@ func readRuns(dir string) ([]model.Run, error) {
 		if len(runs) >= maxRuns || total+info.Size() > maxHistoryBytes {
 			break
 		}
-		var run model.Run
-		err = readJSON(filepath.Join(root, file.Name()), maxRunBytes, &run)
+		run, err := readRun(filepath.Join(root, file.Name()))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}

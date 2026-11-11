@@ -41,16 +41,17 @@ func (a *allocation) add(info os.FileInfo) {
 }
 
 type treeScan struct {
-	ctx      context.Context
-	volume   mount
-	mounts   map[string]mount
-	skipPath string
-	root     allocation
-	details  map[string]*allocation
+	ctx           context.Context
+	volume        mount
+	mounts        map[string]mount
+	skipPath      string
+	snapshotPaths map[string]bool
+	root          allocation
+	details       map[string]*allocation
 }
 
 func measureItem(ctx context.Context, volume mount, mounts map[string]mount, plan *itemPlan) {
-	scan := treeScan{ctx: ctx, volume: volume, mounts: mounts, skipPath: plan.skipPath, details: make(map[string]*allocation)}
+	scan := treeScan{ctx: ctx, volume: volume, mounts: mounts, skipPath: plan.skipPath, snapshotPaths: plan.snapshotPaths, details: make(map[string]*allocation)}
 	for _, detail := range plan.details {
 		scan.details[detail.Path] = &allocation{}
 	}
@@ -100,7 +101,7 @@ func (s *treeScan) visit(p string, info os.FileInfo, detail *allocation) {
 				return
 			}
 			child := path.Join(p, entry.Name())
-			if child == s.skipPath || snapshotDirectory(s.volume.path, child) {
+			if child == s.skipPath || s.snapshotPaths[child] || snapshotDirectory(s.volume.path, child) {
 				continue
 			}
 			if _, mounted := s.mounts[child]; mounted {

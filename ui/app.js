@@ -19,6 +19,8 @@
       free: 'auto',
       mini: true,
       subdivide: true,
+      topCount: '20',
+      groupSort: 'size',
       detailGroup: 'all',
       sort: 'size',
     },
@@ -31,6 +33,12 @@
     );
   } catch (e) {
     prefs = Object.assign({}, defaults);
+  }
+  if (!['10', '20', '25', '50', '100', 'all'].includes(prefs.topCount)) {
+    prefs.topCount = defaults.topCount;
+  }
+  if (!['rank', 'size', 'count'].includes(prefs.groupSort)) {
+    prefs.groupSort = defaults.groupSort;
   }
   function save() {
     try {
@@ -77,6 +85,13 @@
           timeStyle: 'short',
         }).format(d);
   }
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    const totalMinutes = Math.floor(seconds / 60);
+    const hours = String(Math.floor(totalMinutes / 60)).padStart(2, '0');
+    const minutes = String(totalMinutes % 60).padStart(2, '0');
+    return hours + ':' + minutes;
+  }
   var names = {
       shares: 'Freigaben',
       apps: 'Apps',
@@ -94,6 +109,7 @@
       snapshots: '#d37e8c',
       other: '#9cacb8',
       remainder: '#aabcc5',
+      'measured-rest': '#8e9da5',
       reserved: '#becdd2',
       free: '#e1ebef',
     };
@@ -104,7 +120,11 @@
   }
   function latest() {
     var r = runs();
-    return r[r.length - 1];
+    var saved = r[r.length - 1];
+    var live = data.current;
+    if (live && (!data.status?.runId || live.id === data.status.runId) &&
+        (!saved || new Date(live.at) >= new Date(saved.at))) return live;
+    return saved;
   }
   function currentRun() {
     return (
@@ -126,18 +146,53 @@
       return ids.indexOf(i.volumeId) >= 0;
     });
   }
-  function top(r) {
-    return items(r)
+  function isSnapshotSummary(item) {
+    return item.group === 'snapshots' && !item.parentId && item.path === '/' + item.volumeId;
+  }
+  function isSnapshotSource(item) {
+    return item.group === 'snapshots' && item.exclusiveBytes == null && item.referencedBytes == null &&
+      ['btrfs_snapshot_data', 'btrfs_qgroup_exclusive_lower_bound'].includes(item.metric);
+  }
+  function snapshotSourceRows(all, summary) {
+    return all.filter((item) => item.parentId === summary.id && item.volumeId === summary.volumeId && isSnapshotSource(item));
+  }
+  function hasMeasuredBytes(item) {
+    return Number.isFinite(item.bytes) && item.bytes > 0;
+  }
+  function measuredItems(r) {
+    const all = items(r);
+    return all
       .filter(
         (item) =>
           !item.parentId &&
-          Number.isFinite(item.bytes) &&
-          item.bytes > 0 &&
+          hasMeasuredBytes(item) &&
           item.metric !== 'logical' &&
           item.metric !== 'virtual_mount',
       )
-      .sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name, 'de'))
-      .slice(0, 20);
+      .flatMap((item) => {
+        if (!isSnapshotSummary(item)) return [item];
+        const sources = snapshotSourceRows(all, item).filter(hasMeasuredBytes);
+        // A complete breakdown replaces the total so both views account for the same bytes.
+        return sources.reduce((sum, source) => sum + source.bytes, 0) === item.bytes ? sources : [item];
+      })
+      .sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name, 'de'));
+  }
+  function rankingLabel() {
+    return prefs.topCount === 'all' ? 'Alle Posten' : 'Top ' + prefs.topCount;
+  }
+  function rankedOverview(run) {
+    const measured = measuredItems(run);
+    const ranked = prefs.topCount === 'all' ? measured : measured.slice(0, Number(prefs.topCount));
+    const summary = measurementSummary(run, measured);
+    return { measured, ranked, summary, groups: groupedItems(ranked, summary.remainder) };
+  }
+  function measurementSummary(r, measured = measuredItems(r)) {
+    const byVolume = new Map(volumes(r).map((v) => [v.id, { used: Number(v.used) || 0, measured: 0 }]));
+    measured.forEach((item) => { const v = byVolume.get(item.volumeId); if (v) v.measured += item.bytes; });
+    return {
+      remainder: [...byVolume.values()].reduce((sum, v) => sum + Math.max(0, v.used - v.measured), 0),
+      weights: byVolume,
+    };
   }
   function sums(r) {
     var vs = volumes(r);
@@ -174,24 +229,18 @@
     $('#volume-filter').value = volumeChoice;
   }
   function kpis(r) {
-    var s = sums(r);
-    return (
-      '<div class="kpis"><div class="kpi"><span>Gesamtkapazität</span><strong>' +
-      fmt(s.capacity) +
-      '</strong><small>' +
-      volumes(r).length +
-      ' Volume' +
-      (volumes(r).length === 1 ? '' : 's') +
-      '</small></div><div class="kpi"><span>Belegt</span><strong>' +
-      fmt(s.used) +
-      '</strong><small>' +
-      pct(s.used, s.capacity).toFixed(1).replace('.', ',') +
-      ' % der Kapazität</small></div><div class="kpi"><span>Frei</span><strong>' +
-      fmt(s.free) +
-      '</strong><small>Verfügbarer Speicher</small></div></div>'
-    );
+    const s = sums(r);
+    const count = volumes(r).length;
+    const capacityBody = `<span class="kpi-heading"><span>Gesamtkapazität</span><small>${count} Volume${count === 1 ? '' : 's'}</small></span>
+      <strong>${fmt(s.capacity)}</strong>`;
+    const capacity = volumeChoice === 'all'
+      ? `<div class="kpi">${capacityBody}</div>`
+      : `<button class="kpi kpi-return" data-volume="all" aria-label="Alle Volumes anzeigen">${capacityBody}<span class="kpi-return-arrow" aria-hidden="true">◀</span></button>`;
+    return `<div class="kpis">${capacity}
+      <div class="kpi"><span class="kpi-heading"><span>Belegt</span><small>${pct(s.used, s.capacity).toFixed(1).replace('.', ',')} % der Kapazität</small></span><strong>${fmt(s.used)}</strong></div>
+      <div class="kpi"><span class="kpi-heading"><span>Frei</span><small>Verfügbarer Speicher</small></span><strong>${fmt(s.free)}</strong></div></div>`;
   }
-  function groupedItems(ranked) {
+  function groupedItems(ranked, remainder) {
     const groups = new Map();
     ranked.forEach((item, index) => {
       if (!groups.has(item.group))
@@ -200,7 +249,19 @@
       group.bytes += item.bytes;
       group.rows.push({ item, rank: index + 1 });
     });
-    return [...groups.values()].sort((a, b) => b.bytes - a.bytes);
+    if (remainder && !groups.has('other')) {
+      groups.set('other', { key: 'other', bytes: 0, rows: [] });
+    }
+    const ordered = [...groups.values()];
+    for (const group of ordered) {
+      const unmeasured = group.key === 'other' ? remainder : 0;
+      group.totalBytes = group.bytes + unmeasured;
+      group.entryCount = group.rows.length + (unmeasured ? 1 : 0);
+    }
+    // Stable sorting preserves the first item's rank when group totals tie.
+    if (prefs.groupSort === 'size') ordered.sort((a, b) => b.totalBytes - a.totalBytes);
+    if (prefs.groupSort === 'count') ordered.sort((a, b) => b.entryCount - a.entryCount);
+    return ordered;
   }
 
   function groupColor(group) {
@@ -219,92 +280,104 @@
     );
   }
 
-  function groupCards(run, ranked = top(run), groups = groupedItems(ranked)) {
-    const maximum = ranked[0]?.bytes;
+  function itemLabel(item) {
+    if (item.group !== 'snapshots' || !item.snapshotCount) return item.name;
+    return `${item.name} · ${item.snapshotCount} ${item.snapshotCount === 1 ? 'Snapshot' : 'Snapshots'}`;
+  }
+
+  function itemLocation(item, volume) {
+    const volumeName = volume?.name || item.volumeId || '';
+    if (item.group === 'apps') {
+      const directory = typeof item.path === 'string' ? item.path.split('/').filter(Boolean).at(-1) : '';
+      return [volumeName, directory].filter(Boolean).join(' › ');
+    }
+    return volumeChoice === 'all' ? volumeName : '';
+  }
+
+  function groupCards(run, { ranked, groups, summary }) {
+    const { remainder } = summary;
+    const maximum = Math.max(ranked[0]?.bytes || 0, remainder);
     return groups
       .map(
-        ({ key, bytes, rows }) => `
+        ({ key, totalBytes, rows }) => {
+          const entryLabel = prefs.topCount === 'all'
+            ? `${rows.length} ${rows.length === 1 ? 'Eintrag' : 'Einträge'}`
+            : `${rows.length} in den ${rankingLabel()}`;
+          return `
       <article class="group-card">
         <button class="group-head" data-group="${esc(key)}" aria-pressed="${selectedItem(key)}">
           <span class="dot" style="background:${groupColor(key)}"></span>
-          <span class="group-label"><strong>${esc(names[key] || key)}</strong><small>${rows.length} in den Top 20</small></span>
-          <strong>${fmt(bytes)}</strong>
+          <span class="group-label"><strong>${esc(names[key] || key)}</strong>${rows.length ? `<small>${entryLabel}</small>` : ''}</span>
+          <strong>${rows.some(({item}) => item.metric === 'btrfs_qgroup_exclusive_lower_bound') ? '≥ ' : ''}${fmt(totalBytes)}</strong>
         </button>
-        <div class="rows">${rows
+        <div class="rows">${key === 'other' && remainder ? `<div class="item-row"><span class="rank" aria-hidden="true"></span><span class="item-name">Nicht erfasst</span><span class="item-value">${fmt(remainder)}</span>${prefs.mini ? `<span class="mini"><i style="width:${pct(remainder, maximum)}%;background:${groupColor('remainder')}"></i></span>` : ''}</div>` : ''}${rows
           .map(({ item, rank }) => {
             const volume = run.volumes.find(
               (entry) => entry.id === item.volumeId,
             );
+            const location = itemLocation(item, volume);
             return `<button class="item-row" data-item="${esc(item.id)}" data-group="${esc(key)}"
               aria-pressed="${Boolean(selectedItem(key, item.id))}">
             <span class="rank" aria-label="Platz ${rank}">${rank}</span>
-            <span class="item-name">${esc(item.name)}
-              ${volumeChoice === 'all' ? `<small>${esc(volume?.name || item.volumeId)}</small>` : ''}</span>
-            <span class="item-value">${fmt(item.bytes)}</span>
+            <span class="item-name">${esc(itemLabel(item))}
+              ${location ? `<small>${esc(location)}</small>` : ''}</span>
+            <span class="item-value">${item.metric === 'btrfs_qgroup_exclusive_lower_bound' ? '≥ ' : ''}${fmt(item.bytes)}</span>
             ${prefs.mini ? `<span class="mini"><i style="width:${pct(item.bytes, maximum)}%;background:${groupColor(key)}"></i></span>` : ''}
           </button>`;
           })
           .join('')}</div>
-      </article>`,
+      </article>`;
+        },
       )
       .join('');
   }
 
-  function chartSegments(ranked, groups, total, comparison, showFree) {
-    const segments = groups.flatMap(({ key, bytes, rows }) =>
+  function chartSegments(ranked, groups, total, measured, summary, showFree) {
+    const rankedIds = new Set(ranked.map((item) => item.id));
+    const weight = (item) => {
+      const volume = summary.weights.get(item.volumeId);
+      return item.bytes * (volume && volume.measured > volume.used ? volume.used / volume.measured : 1);
+    };
+    const segments = groups.filter((group) => group.rows.length).flatMap(({ key, bytes, rows }) =>
       prefs.subdivide
-        ? rows.map(({ item }) => ({
-            group: key,
-            id: item.id,
-            name: item.name,
-            value: item.bytes,
-          }))
-        : [{ group: key, name: names[key] || key, value: bytes }],
+        ? rows.map(({ item }) => ({ group: key, id: item.id, name: itemLabel(item), value: item.bytes, weight: weight(item) }))
+        : [{ group: key, name: names[key] || key, value: bytes, weight: rows.reduce((sum, row) => sum + weight(row.item), 0) }],
     );
-    if (!comparison) {
-      const known = ranked.reduce((sum, item) => sum + item.bytes, 0);
-      const rest = Math.max(0, total.used - known);
-      const reserved = Math.max(0, total.capacity - total.used - total.free);
-      if (rest)
-        segments.push({
-          group: 'remainder',
-          name: 'Übrige Belegung',
-          value: rest,
-        });
-      if (showFree && reserved)
-        segments.push({
-          group: 'reserved',
-          name: 'Reserviert',
-          value: reserved,
-        });
-      if (showFree && total.free)
-        segments.push({ group: 'free', name: 'Frei', value: total.free });
-    }
+    const outside = measured.filter((item) => !rankedIds.has(item.id));
+    if (outside.length) segments.push({
+      group: 'measured-rest', name: 'Weitere erfasste Posten',
+      value: outside.reduce((sum, item) => sum + item.bytes, 0),
+      weight: outside.reduce((sum, item) => sum + weight(item), 0),
+    });
+    if (summary.remainder) segments.push({ group: 'remainder', name: 'Nicht erfasst', value: summary.remainder });
+    const reserved = Math.max(0, total.capacity - total.used - total.free);
+    if (showFree && reserved) segments.push({ group: 'reserved', name: 'Reserviert', value: reserved });
+    if (showFree && total.free) segments.push({ group: 'free', name: 'Frei', value: total.free });
     return segments;
   }
 
   function segmentAttributes(segment) {
     const { group, id, name, value } = segment;
     const label = esc(name + ' · ' + fmt(value));
-    const action = ['free', 'remainder', 'reserved'].includes(group)
+    const action = ['free', 'remainder', 'reserved', 'measured-rest'].includes(group)
       ? ''
       : `data-group="${esc(group)}" ${id ? `data-item="${esc(id)}"` : ''}
-      aria-pressed="${Boolean(selectedItem(group, id))}"`;
+      aria-pressed="${Boolean(id ? selectedItem(group, id) : selected === 'group:' + group)}"`;
     return { label, action };
   }
 
-  function renderBar(segments, basis) {
+  function renderBar(segments, basis, total) {
     return `<div class="stack" aria-label="Speicherverteilung">${segments
       .map((segment) => {
         const { label, action } = segmentAttributes(segment);
-        const style = `width:${pct(segment.value, basis)}%;background:${groupColor(segment.group)}`;
+        const style = `width:${pct(segment.weight ?? segment.value, basis)}%;background:${groupColor(segment.group)}`;
         if (!action)
           return `<span class="segment" title="${label}" style="${style}"></span>`;
         return `<button class="segment" ${action} title="${label}" aria-label="${label}" style="${style}"></button>`;
       })
       .join(
         '',
-      )}</div><div class="bar-caption"><span>0</span><span>Basis: ${fmt(basis)}</span></div>`;
+      )}</div><div class="bar-caption"><span>Belegt: ${fmt(total.used)} von ${fmt(total.capacity)}</span></div>`;
   }
 
   function renderDonut(segments, basis, used) {
@@ -315,9 +388,9 @@
     let offset = 0;
     const slices = segments
       .map((segment) => {
-        const fraction = Math.min(0.999999, segment.value / basis);
+        const fraction = Math.min(0.999999, (segment.weight ?? segment.value) / basis);
         const path = `M ${point(offset)} A 72 72 0 ${fraction > 0.5 ? 1 : 0} 1 ${point(offset + fraction)}`;
-        offset += segment.value / basis;
+        offset += (segment.weight ?? segment.value) / basis;
         const { label, action } = segmentAttributes(segment);
         return `<path class="segment" d="${path}" stroke="${groupColor(segment.group)}" stroke-width="28"
         fill="none" ${action ? `${action} role="button" tabindex="0" aria-label="${label}"` : ''}>
@@ -328,81 +401,81 @@
       <div class="donut-center"><strong>${fmt(used)}</strong><span>Volume belegt</span></div></div>`;
   }
 
-  function chart(run) {
+  function chart(run, overview) {
     const total = sums(run);
-    const ranked = top(run);
-    const groups = groupedItems(ranked);
-    const known = ranked.reduce((sum, item) => sum + item.bytes, 0);
-    const comparison =
-      ranked.some((item) => item.additive === false) || known > total.used + 1;
+    const { measured, ranked, groups, summary } = overview;
+    const comparison = measured.some((item) => item.additive === false) ||
+      [...summary.weights.values()].some((volume) => volume.measured > volume.used + 1);
     const showFree =
       prefs.free === 'show' || (prefs.free === 'auto' && !selected);
-    const segments = chartSegments(ranked, groups, total, comparison, showFree);
-    const basis = segments.reduce((sum, segment) => sum + segment.value, 0);
+    const segments = chartSegments(ranked, groups, total, measured, summary, showFree);
+    const basis = segments.reduce((sum, segment) => sum + (segment.weight ?? segment.value), 0);
     const donut = prefs.chart === 'donut';
+    const label = rankingLabel();
     const subtitle = comparison
-      ? 'Top 20 nach Messwert · mögliche Überschneidungen'
+      ? `${label} nach Messwert · mögliche Überschneidungen`
       : showFree
-        ? 'Top 20 nach Einzelgröße · gesamte Kapazität'
-        : 'Top 20 nach Einzelgröße · belegter Speicher';
-    const capacity =
-      comparison && showFree
-        ? `<div class="capacity-context"><span>Volume-Belegung</span>
-      <span class="volume-meter"><i style="width:${pct(total.used, total.capacity)}%"></i></span>
-      <span>${fmt(total.free)} frei</span></div>`
-        : '';
+        ? `${label} nach Einzelgröße · gesamte Kapazität`
+        : `${label} nach Einzelgröße · belegter Speicher`;
     const diagram = !basis
       ? '<div class="empty">Keine Werte für das Diagramm.</div>'
       : donut
         ? `<div class="donut-layout">${renderDonut(segments, basis, total.used)}
-        <div class="donut-cards"><div class="group-grid">${groupCards(run, ranked, groups)}</div></div></div>`
-        : renderBar(segments, basis);
-    const note = comparison
-      ? 'Gemeinsam genutzte Blöcke können in mehreren Posten auftauchen. Die Belegung des Dateisystems steht oben.'
-      : 'Die Gruppen enthalten Posten aus den Top 20. Weitere Segmente zeigen die übrige Belegung' +
-        (showFree ? ' und den freien Platz.' : '.');
+        <div class="donut-cards"><div class="group-grid">${groupCards(run, overview)}</div></div></div>`
+        : renderBar(segments, basis, total);
+    const note = '„Nicht erfasst“ zeigt die Differenz zwischen Belegung und Summe der Messwerte je Volume.' +
+      (comparison ? ' Gemeinsam genutzte Btrfs-Blöcke können mehrfach in den Messwerten stehen.' : '');
     return `<section class="panel chart-panel"><div class="section-head"><div><h3>Speicherverteilung</h3><p>${subtitle}</p></div>
       <div class="segmented"><button data-chart="bar" class="${donut ? '' : 'active'}">Balken</button>
       <button data-chart="donut" class="${donut ? 'active' : ''}">Torte</button></div></div>
-      ${capacity}${diagram}<p class="hint">${note}</p></section>`;
+      ${diagram}<p class="hint">${note}</p></section>`;
   }
   function volumeSummary(r) {
     if (volumeChoice !== 'all') return '';
-    return (
-      '<div class="volume-strip">' +
-      volumes(r)
-        .map(function (v) {
-          return (
-            '<button class="volume-tile" data-volume="' +
-            esc(v.id) +
-            '"><span>' +
-            esc(v.name) +
-            ' <small>' +
-            esc(v.fs || '') +
-            '</small></span><strong>' +
-            fmt(v.used) +
-            ' <small>von ' +
-            fmt(v.capacity) +
-            '</small></strong><span class="volume-meter"><i style="width:' +
-            pct(v.used, v.capacity) +
-            '%"></i></span><small>' +
-            fmt(v.free) +
-            ' frei &nbsp; →</small></button>'
-          );
-        })
-        .join('') +
-      '</div>'
-    );
+    return `<div class="volume-strip">${volumes(r).map((v) => `
+      <button class="volume-tile" data-volume="${esc(v.id)}" aria-label="${esc(v.name)} anzeigen">
+        <span class="volume-heading"><span>${esc(v.name)} <small>${esc(v.fs || '')}</small></span><span class="volume-arrow" aria-hidden="true">▶</span></span>
+        <span class="volume-values"><strong>${fmt(v.used)} <small>von ${fmt(v.capacity)}</small></strong><small>${fmt(v.free)} frei</small></span>
+        <span class="volume-meter"><i style="width:${pct(v.used, v.capacity)}%"></i></span>
+      </button>`).join('')}</div>`;
+  }
+  function snapshotValue(bytes, metric) {
+    if (bytes == null || !Number.isFinite(Number(bytes))) return 'Nicht ermittelt';
+    return (metric === 'btrfs_qgroup_exclusive_lower_bound' ? '≥ ' : '') + fmt(bytes);
+  }
+
+  function snapshotBreakdown(run) {
+    const all = items(run);
+    const summaries = all.filter(isSnapshotSummary);
+    if (!summaries.length) return '';
+    const sections = summaries.map((summary) => {
+      const volume = volumes(run).find((entry) => entry.id === summary.volumeId);
+      let sources = snapshotSourceRows(all, summary);
+      if (!sources.length) {
+        sources = all.filter((item) => item.volumeId === summary.volumeId && item.group !== 'snapshots' && item.snapshotCount)
+          .map((item) => ({ ...item, bytes: item.snapshotBytes, metric: item.snapshotMetric || 'btrfs_qgroup_exclusive_lower_bound' }));
+      }
+      const rows = sources.map((source) => `<tr><td><strong>${esc(source.name)}</strong><small>${esc(source.path || '')}</small></td>
+        <td>${source.snapshotCount != null ? esc(source.snapshotCount) : '–'}</td>
+        <td>${snapshotValue(source.bytes, source.metric)}</td></tr>`).join('');
+      return `<div class="table-wrap"><table><thead><tr><th>Quelle auf ${esc(volume?.name || summary.volumeId)}</th><th>Snapshots</th><th>Nur in Snapshots</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="3">Keine Aufschlüsselung nach Quelle verfügbar</td></tr>'}
+        <tr><td><strong>Volume gesamt</strong></td><td>${summary.snapshotCount != null ? esc(summary.snapshotCount) : '–'}</td>
+        <td><strong>${snapshotValue(summary.bytes, summary.metric)}</strong></td></tr></tbody></table></div>`;
+    }).join('');
+    return `<section class="snapshot-breakdown"><div class="section-head"><div><h3>Snapshots nach Quell-Volume</h3>
+      <p>≥ kennzeichnet eine Untergrenze aus exklusiven Qgroup-Werten.</p></div></div>${sections}</section>`;
   }
   function current() {
-    var r = latest();
+    const run = latest();
+    const overview = rankedOverview(run);
     return (
-      kpis(r) +
-      volumeSummary(r) +
-      chart(r) +
+      kpis(run) +
+      volumeSummary(run) +
+      chart(run, overview) +
       (prefs.chart === 'bar'
-        ? '<div class="section-head cards-heading"><div><h3>Die größten Speicherposten</h3><p>Nach Einzelgröße gewählt und anschließend gruppiert.</p></div><span class="count">TOP 20</span></div><div class="group-grid">' +
-          (groupCards(r) ||
+        ? `<div class="section-head cards-heading"><div><h3>Die größten Speicherposten</h3><p>Nach Einzelgröße gewählt und anschließend gruppiert.</p></div><span class="count">${rankingLabel()}</span></div><div class="group-grid">` +
+          (groupCards(run, overview) ||
             '<div class="empty">Keine auswertbaren Einzelposten vorhanden.</div>') +
           '</div>'
         : '')
@@ -410,12 +483,13 @@
   }
 
   function history() {
-    const all = runs();
+    const all = runs().filter((run) => !run.partial);
     const records = all.filter((run) => volumes(run).length);
     if (!records.length)
       return '<div class="empty">Für dieses Volume liegen keine Messstände vor.</div>';
     const chosen = records.find((run) => run.id === dateId) || records.at(-1);
-    const ranks = new Map(records.map((run) => [run.id, top(run).slice(0, 5)]));
+    const overview = rankedOverview(chosen);
+    const ranks = new Map(records.map((run) => [run.id, (run === chosen ? overview.measured : measuredItems(run)).slice(0, 5)]));
     const visible = ranks.get(chosen.id);
     const palette = ['#467bc5', '#35a3ae', '#8b79bb', '#d37e8c', '#c18a49'];
     const upper = Math.max(
@@ -505,7 +579,7 @@
     const legend = visible
       .map(
         (item, i) =>
-          `<span><i style="background:${palette[i]}"></i>${esc(item.name)}</span>`,
+          `<span><i style="background:${palette[i]}"></i>${esc(itemLabel(item))}</span>`,
       )
       .join('');
     const choices = records
@@ -522,9 +596,9 @@
       ${ticks}${occupied}${lines}${labels}${markers}</svg></div>
       <div class="legend"><span><i style="background:#176e83"></i>Belegt</span>${legend}</div>
       <div class="date-picker"><label>Erhebung auswählen <select id="date-select">${choices}</select></label></div></section>
-      <div class="section-head cards-heading"><div><h3>Top 20 zur ausgewählten Erhebung</h3>
+      <div class="section-head cards-heading"><div><h3>${rankingLabel()} zur ausgewählten Erhebung</h3>
       <p>${esc(date(chosen.at))}</p></div></div><div class="group-grid">
-      ${groupCards(chosen) || '<div class="empty">Keine Einzelposten vorhanden.</div>'}</div>`;
+      ${groupCards(chosen, overview) || '<div class="empty">Keine Einzelposten vorhanden.</div>'}</div>`;
   }
   function details() {
     const metrics = {
@@ -535,20 +609,24 @@
       virtual_mount: 'Virtuelle Ansicht',
       docker_image: 'Docker-Image-Größe',
       btrfs_snapshot: 'Btrfs-Snapshot',
+      btrfs_snapshot_data: 'Snapshot-Daten',
       btrfs_qgroup: 'Btrfs-Qgroup',
       btrfs_qgroup_exclusive: 'Btrfs-Qgroup, exklusiv',
       btrfs_qgroup_exclusive_lower_bound: 'Btrfs-Qgroup, Untergrenze',
       unknown: 'Offen',
     };
-    const all = items(latest());
+    const run = latest();
+    const all = items(run);
     const groups = new Set(all.map((item) => item.group));
     const { sort } = prefs;
     const detailGroup = groups.has(prefs.detailGroup)
       ? prefs.detailGroup
       : 'all';
-    const list = all.filter(function (i) {
-      return detailGroup === 'all' || i.group === detailGroup;
-    });
+    const breakdown = detailGroup === 'snapshots' ? snapshotBreakdown(run) : '';
+    const summaryIds = new Set(breakdown ? all.filter(isSnapshotSummary).map((item) => item.id) : []);
+    const list = all.filter((item) =>
+      (detailGroup === 'all' || item.group === detailGroup) &&
+      !summaryIds.has(item.id) && !(summaryIds.has(item.parentId) && isSnapshotSource(item)));
     list.sort(function (a, b) {
       if (sort === 'size')
         return (Number(b.bytes) || 0) - (Number(a.bytes) || 0);
@@ -589,7 +667,7 @@
           );
         })
         .join('') +
-      '</div><div class="table-wrap"><table><thead><tr><th>Name / Pfad</th><th>Gruppe</th><th>Messbasis</th><th>Größe</th></tr></thead><tbody>' +
+      '</div>' + breakdown + '<div class="table-wrap"><table><thead><tr><th>Name / Pfad</th><th>Gruppe</th><th>Messbasis</th><th>Größe</th></tr></thead><tbody>' +
       list
         .map(function (i) {
           return (
@@ -603,9 +681,9 @@
               ? '<small>Snapshots · ' +
                 esc(i.snapshotCount) +
                 (i.snapshotBytes != null
-                  ? ' · mindestens ' +
-                    fmt(i.snapshotBytes) +
-                    ' exklusiv (' +
+                  ? ' · ' +
+                    snapshotValue(i.snapshotBytes, i.snapshotMetric || 'btrfs_qgroup_exclusive_lower_bound') +
+                    ' Snapshot-Daten (' +
                     esc(i.measuredSnapshots) +
                     '/' +
                     esc(i.snapshotCount) +
@@ -625,9 +703,10 @@
             '</td><td>' +
             esc(names[i.group] || i.group) +
             '</td><td>' +
-            esc(metrics[i.metric] || i.metric || '–') +
+            esc(i.metric === 'btrfs_snapshot_data' && i.exclusiveBytes != null
+              ? 'Snapshot-Daten, exklusiv' : metrics[i.metric] || i.metric || '–') +
             '</td><td>' +
-            fmt(i.bytes) +
+            (i.metric === 'btrfs_qgroup_exclusive_lower_bound' && i.bytes != null ? '≥ ' : '') + fmt(i.bytes) +
             '</td></tr>'
           );
         })
@@ -635,36 +714,170 @@
       '</tbody></table></div>' +
       (list.length
         ? ''
-        : '<div class="empty">Keine Werte für diese Auswahl.</div>') +
+        : `<div class="empty">Keine ${breakdown ? 'Einzelwerte' : 'Werte'} für diese Auswahl.</div>`) +
       '</section>'
     );
   }
+  function systemInfo() {
+    const info = data.hardware;
+    if (!info) return '<section class="panel"><h3>System &amp; Speicher</h3><p>Die Informationen werden bei der nächsten Datenerfassung ermittelt.</p></section>';
+    const devices = Array.isArray(info.devices) ? info.devices : [];
+    const disks = devices.filter((d) => d.kind === 'disk');
+    const parts = devices.filter((d) => d.kind === 'partition');
+    const raids = devices.filter((d) => d.kind === 'raid');
+    const mappers = devices.filter((d) => d.kind === 'mapper');
+    const usb = disks.filter((d) => d.transport === 'usb');
+    const memberOf = (name) => raids.filter((r) => (r.members || []).includes(name)).map((r) => r.name);
+    const raidColors = ['#218b91', '#467bc5', '#8b79bb', '#c98254', '#7e9f58', '#bb7693', '#6c90a1'];
+    const partitionColor = (p) => p.free ? '#e1e9ed' : p.raids?.length ? raidColors[raids.findIndex((r) => r.name === p.raids[0]) % raidColors.length] : '#a5b8c1';
+    const card = (title, value, ...details) => `<div class="system-card"><span>${esc(title)}</span><strong>${esc(value)}</strong>${details.map((detail) => `<small>${esc(detail)}</small>`).join('')}</div>`;
+    const usbText = usb.length ? usb.map((d) => `${d.name} · ${d.model || 'USB-Laufwerk'} · ${fmt(d.size)}`).join(' | ') : 'Kein USB-Laufwerk erkannt';
+    const bars = (disk, scale) => {
+      let end = 0;
+      const segments = [];
+      parts.filter((p) => p.parent === disk.name).sort((a,b) => a.start - b.start).forEach((p) => {
+        if (p.start > end) segments.push({name:'Nicht partitioniert', start:end, size:p.start-end, free:true});
+        segments.push({name:p.name, start:p.start, size:p.size, raids:memberOf(p.name)});
+        end = Math.max(end, p.start + p.size);
+      });
+      if (disk.size > end) segments.push({name:'Nicht partitioniert', start:end, size:disk.size-end, free:true});
+      if (!disk.size) return '<p class="hint">Größe nicht verfügbar.</p>';
+      return `<div class="disk-bar" style="width:${pct(disk.size, scale || disk.size)}%" aria-label="Partitionen von ${esc(disk.name)}">${segments.map((p) => {
+        const label = `${p.name} · ${fmt(p.size)}${p.raids?.length ? ' · ' + p.raids.join(', ') : ''}`;
+        return `<span class="disk-segment${p.free ? '' : ' disk-segment-partition'}" style="width:${pct(p.size, disk.size)}%;background:${partitionColor(p)}" title="${esc(label)}" aria-label="${esc(label)}"></span>`;
+      }).join('')}</div><div class="disk-parts">${segments.filter((p) => !p.free || p.size > 1024 * 1024).map((p) => `<span><i style="background:${partitionColor(p)}"></i>${esc(p.name)} · ${fmt(p.size)}${p.raids?.length ? ' · ' + esc(p.raids.join(', ')) : ''}</span>`).join('')}</div>`;
+    };
+    const topology = window.SynoUsageTopology.build(info);
+    const overviewGroups = topology.groups.map((group) => {
+      const scale = Math.max(...group.disks.map((disk) => Number(disk.size) || 0), 0);
+      const title = group.raids.length ? group.raids.map((raid) => `${raid.name} · ${raid.level || 'RAID'}`).join(' + ') : 'Ohne erkannte RAID-Zuordnung';
+      const lvmLabel = group.volumeGroups.length ? 'LVM: ' + group.volumeGroups.join(', ') : '';
+      const volumeLabels = group.volumes.length ? group.volumes.map((mount) => `<span class="storage-volume">Verbunden: ${esc(mount.replace(/^\//, ''))}</span>`).join('') : '<span class="storage-unknown">Volume-Zuordnung nicht ermittelt</span>';
+      const entries = group.disks.map((disk) => `<article class="disk-card"><div class="disk-head"><strong>${esc(disk.name)}${disk.model ? ' · ' + esc(disk.model) : ''}${disk.medium ? ' · ' + esc(disk.medium) : ''}</strong><span>${fmt(disk.size)}</span></div>${bars(disk, scale)}</article>`).join('');
+      return `<div class="storage-group"><div class="storage-group-head"><strong>${esc(title)}</strong><span class="storage-relations">${lvmLabel ? `<small>${esc(lvmLabel)}</small>` : ''}${volumeLabels}</span></div><div class="disk-list">${entries || '<p class="hint">Mitgliedslaufwerke nicht eindeutig erkannt.</p>'}</div></div>`;
+    }).join('');
+    const raidRows = raids.map((r) => `<tr><td>${esc(r.name)}</td><td>${esc(r.level || '–')}</td><td>${fmt(r.size)}</td><td>${esc((r.members || []).join(', ') || '–')}</td><td>${esc((r.mounts || []).join(', ') || r.state || '–')}</td></tr>`).join('');
+    const mapperRows = mappers.map((m) => `<tr><td>${esc(m.label || m.name)} <small>(${esc(m.name)})</small></td><td>${fmt(m.size)}</td><td>${esc((m.members || []).join(', ') || '–')}</td><td>${esc((m.mounts || []).join(', ') || '–')}</td></tr>`).join('');
+    const pvRows = (info.pvs || []).map((v) => `<tr><td>${esc(v.name)}</td><td>${esc(v.group || '–')}</td><td>${fmt(v.size)}</td><td>${fmt(v.free)}</td></tr>`).join('');
+    const lvRows = (info.lvm || []).map((v) => `<tr><td>${esc(v.group + ' / ' + v.name)}</td><td>${fmt(v.size)}</td><td>${esc(v.devices || '–')}</td></tr>`).join('');
+    const vmRows = (latest()?.items || []).filter((item) => item.group === 'vmm' && item.parentId).map((item) => `<tr><td>${esc(item.name)}</td><td>${esc(item.volumeId)}</td><td>${esc(item.path || '–')}</td><td>${fmt(item.bytes)}</td></tr>`).join('');
+    const volumeItems = latest()?.items || [];
+    const measuredFileBlocks = (item) => item.bytes != null && ['allocated_blocks', 'physical'].includes(item.metric);
+    const parentsWithDetails = new Set(volumeItems.filter((item) => item.parentId && item.group === 'apps' && measuredFileBlocks(item)).map((item) => item.parentId));
+    const topForVolume = (volumeId, group) => {
+      const totals = new Map();
+      volumeItems.filter((item) => item.volumeId === volumeId && item.group === group && measuredFileBlocks(item) &&
+        (group === 'shares' ? !item.parentId : !parentsWithDetails.has(item.id)))
+        .forEach((item) => totals.set(item.name, (totals.get(item.name) || 0) + Number(item.bytes)));
+      return [...totals].sort((a,b) => b[1] - a[1]).slice(0, 3);
+    };
+    const topList = (items) => items.length ? `<ul class="volume-top-list">${items.map(([name, size]) => `<li><span>${esc(name)}</span><strong>${fmt(size)}</strong></li>`).join('')}</ul>` : '<p class="hint">Keine Werte erfasst.</p>';
+    const volumeCards = (latest()?.volumes || []).map((volume) => `<article class="disk-card volume-detail-card"><div class="disk-head"><strong>${esc(volume.name || volume.id)}</strong><span>${fmt(volume.used)} belegt · ${fmt(volume.capacity)} gesamt</span></div><div class="volume-top-columns"><div><h4>Größte Freigaben</h4>${topList(topForVolume(volume.id, 'shares'))}</div><div><h4>Größte App-Posten</h4>${topList(topForVolume(volume.id, 'apps'))}</div></div></article>`).join('');
+    const cpuDetail = [info.cpus ? info.cpus + ' logische Prozessoren' : 'Prozessoranzahl nicht verfügbar', info.maxMHz ? 'max. ' + (info.maxMHz / 1000).toLocaleString('de-DE', {maximumFractionDigits: 2}) + ' GHz' : 'Maximaltakt nicht verfügbar'].join(' · ');
+    const root = info.root;
+    const rootView = root ? `<div class="system-root-values"><strong>${fmt(root.used)} belegt</strong><span>von ${fmt(root.capacity)} · ${fmt(root.free)} verfügbar</span></div><div class="volume-meter"><i style="width:${pct(root.used,root.capacity)}%"></i></div>` : '<p class="hint">Die Größe und Belegung konnten nicht ermittelt werden.</p>';
+    const layouts = info.partitionLayouts ? `<details class="partition-layouts"><summary>Verfügbare Synology-Partitionsvorlagen</summary><p class="hint">Ausgabe von synopartition --list. Die Liste beschreibt mögliche Layouts; sie weist nicht automatisch das aktuell verwendete Layout aus.</p><pre>${esc(info.partitionLayouts)}</pre></details>` : '';
+    const dsm = info.dsm ? 'DSM ' + info.dsm : 'DSM-Version nicht verfügbar';
+    const kernel = info.kernel ? 'Linux-Kernel ' + info.kernel : 'Linux-Kernelversion nicht verfügbar';
+    return `<div class="system-cards">${card('System', info.model || 'Nicht verfügbar', dsm, kernel)}${card('CPU', info.cpu || 'Nicht verfügbar', cpuDetail)}${card('Arbeitsspeicher', info.memory ? fmt(info.memory) : 'Nicht verfügbar', 'Vom Betriebssystem nutzbar · RAM-Riegel: nicht ermittelt')}${card('USB-Laufwerke', usbText, 'Interner Bootspeicher nur bei eindeutiger Erkennung zuordenbar')}</div>
+      <section class="panel storage-overview"><div class="section-head"><div><h3>Speicheraufbau</h3><p>Laufwerke nach erkannten RAID- und LVM-Verbindungen gruppiert. Die Balken sind innerhalb eines Verbunds proportional zur Laufwerksgröße; sehr kleine Partitionen werden zur Sichtbarkeit breiter dargestellt.</p></div></div>${overviewGroups || '<p class="hint">Keine Laufwerke erkannt.</p>'}<p class="hint">Ein Laufwerk kann in mehreren Verbünden erscheinen. System- und Swap-Arrays können Laufwerke mehrerer Verbünde gemeinsam nutzen. „Verbunden“ beschreibt den Gerätepfad; eine Cache-Funktion wird nicht automatisch angenommen. Nicht partitionierter Platz ist nicht automatisch nutzbarer Pool-Speicher.</p></section>
+      <section class="panel system-section system-root"><h3>Systempartition /</h3>${rootView}<p class="hint">Dateisystemgröße und Belegung; die Größe des zugrunde liegenden RAID-Arrays steht unten.</p>${layouts}</section>
+      <section class="panel system-section"><h3>Volumes</h3><p class="hint">Jeweils die drei größten erkannten Freigaben und App-Posten; Messwerte können gemeinsam genutzte Blöcke enthalten.</p><div class="disk-list">${volumeCards || '<p class="hint">Keine Volumes erfasst.</p>'}</div></section>
+      <section class="panel system-section"><h3>RAID-Arrays</h3><p class="hint">Mitglieder sind Partitionen. Die RAID-Größe ist nicht die Summe ihrer Mitglieder.</p><div class="table-wrap"><table><thead><tr><th>Array</th><th>Typ</th><th>Größe</th><th>Mitglieder</th><th>Mount / Zustand</th></tr></thead><tbody>${raidRows || '<tr><td colspan="5">Keine Arrays erkannt.</td></tr>'}</tbody></table></div></section>
+      <section class="panel system-section"><h3>LVM und Gerätezuordnung</h3>
+        <p class="hint">LVM-Volumengruppen fassen erkannte physische Volumes zusammen. Geräte ohne eindeutige Zuordnung bleiben separat aufgeführt.</p>
+        <section class="mapping-section"><h4>Physische Volumes (PV)</h4><div class="table-wrap"><table><thead><tr><th>Gerät</th><th>Gruppe</th><th>Größe</th><th>Frei im PV</th></tr></thead><tbody>${pvRows || '<tr><td colspan="4">Keine LVM-Volumes erkannt.</td></tr>'}</tbody></table></div></section>
+        <section class="mapping-section"><h4>Logische Volumes (LV)</h4><div class="table-wrap"><table><thead><tr><th>Gruppe / Volume</th><th>Größe</th><th>Geräte</th></tr></thead><tbody>${lvRows || '<tr><td colspan="3">Keine logischen Volumes erkannt.</td></tr>'}</tbody></table></div></section>
+        <section class="mapping-section"><h4>Device Mapper</h4><div class="table-wrap"><table><thead><tr><th>Gerät</th><th>Größe</th><th>Untergeordnete Geräte</th><th>Mount</th></tr></thead><tbody>${mapperRows || '<tr><td colspan="4">Keine Device-Mapper-Geräte erkannt.</td></tr>'}</tbody></table></div></section>
+        ${(info.warnings || []).map((w) => `<p class="hint">${esc(w)}</p>`).join('')}<p class="hint">Stand der Hardwareerfassung: ${esc(date(info.at))}</p></section>
+      <section class="panel system-section"><h3>Erkannte VM-Datenträger</h3><p class="hint">Zuordnung nach dem bei der Erfassung gefundenen Ablagepfad.</p><div class="table-wrap"><table><thead><tr><th>Datenträger</th><th>Volume</th><th>Pfad</th><th>Messwert</th></tr></thead><tbody>${vmRows || '<tr><td colspan="4">Keine VM-Datenträger erkannt.</td></tr>'}</tbody></table></div></section>`;
+  }
+  let groupResizeObserver;
+  function observeGroupCards() {
+    groupResizeObserver?.disconnect();
+    const grid = content.querySelector('.group-grid');
+    if (!grid || typeof ResizeObserver !== 'function') return;
+    const cards = [...grid.querySelectorAll(':scope > .group-card')];
+    if (cards.length < 2) return;
+
+    function placeCards() {
+      if (!grid.isConnected) return;
+      const width = grid.getBoundingClientRect().width;
+      if (!width) return;
+      const style = getComputedStyle(grid);
+      const columns = Math.min(cards.length, style.gridTemplateColumns.trim().split(/\s+/).length);
+      const gap = Number.parseFloat(style.columnGap);
+      grid.classList.toggle('packed', columns > 1);
+      if (columns < 2) return;
+
+      const cardWidth = (width - gap * (columns - 1)) / columns;
+      grid.style.setProperty('--group-card-width', `${cardWidth}px`);
+      const heights = cards.map((card) => card.getBoundingClientRect().height);
+      const nextTop = Array(columns).fill(0);
+      for (const [index, card] of cards.entries()) {
+        const top = Math.min(...nextTop);
+        const column = nextTop.indexOf(top);
+        card.style.setProperty('--group-card-left', `${column * (cardWidth + gap)}px`);
+        card.style.setProperty('--group-card-top', `${top}px`);
+        nextTop[column] = top + heights[index] + gap;
+      }
+      grid.style.setProperty('--group-grid-height', `${Math.max(...nextTop) - gap}px`);
+    }
+
+    placeCards();
+    groupResizeObserver = new ResizeObserver(() => requestAnimationFrame(placeCards));
+    groupResizeObserver.observe(grid);
+    cards.forEach((card) => groupResizeObserver.observe(card));
+  }
+
+  let mountedPage;
+
+  async function loadTasks() {
+    if (isPreview) return window.SynoUsageDemo.tasks();
+    const result = await window.SynoUsageDSM.timeline();
+    if (!demo) window.SynoUsageTaskData.addMeasurements(result, runs(), data.status);
+    return result;
+  }
+
   function render() {
-    if (!data || !latest()) return;
+    const run = data && latest();
+    if (!run) return;
     fillVolumes();
-    $('#demo-badge').hidden = !demo;
+    $('#demo-badge').hidden = page === 'tasks' ? !isPreview : !demo;
     var title = {
       current: ['Speicherübersicht', 'Kapazität und größte Speicherposten'],
       history: ['Verlauf', 'Entwicklung und frühere Erhebungen vergleichen.'],
+      tasks: ['Aufgaben', 'Arbeitszeiten, Laufzeiten und geplante Starts'],
       details: ['Details', 'Messwerte und ihre Grundlagen im Überblick.'],
+      info: ['System & Speicher', 'Hardware, Partitionen und Speicheraufbau'],
     }[page];
     $('#page-title').textContent = title[0];
     $('#page-subtitle').textContent = title[1];
+    $('#volume-filter-label').hidden = page === 'info' || page === 'tasks';
     document.querySelectorAll('.nav').forEach(function (b) {
       b.classList.toggle('active', b.dataset.page === page);
       if (b.dataset.page === page) b.setAttribute('aria-current', 'page');
       else b.removeAttribute('aria-current');
     });
-    content.innerHTML =
-      page === 'current'
-        ? current()
-        : page === 'history'
-          ? history()
-          : details();
-    $('#footer-info').textContent =
-      (demo ? 'Beispielstand · ' : 'Letzte Erfassung · ') +
-      date(latest().at) +
-      (data.user ? ' · ' + data.user : '');
+    if (page === 'tasks') {
+      if (mountedPage !== page) window.SynoUsageTasks.mount(content, {load: loadTasks, demo: isPreview});
+    } else {
+      content.innerHTML =
+        page === 'current'
+          ? current()
+          : page === 'history'
+            ? history()
+            : page === 'details' ? details() : systemInfo();
+    }
+    mountedPage = page;
+    observeGroupCards();
+    const duration = formatDuration(run.durationSeconds);
+    $('#header-stand').textContent =
+      (demo ? 'Beispielstand: ' : run.partial ? 'Teilstand: ' : 'Stand: ') + date(run.at) +
+      (duration ? ' · Dauer: ' + duration : '');
+    $('#header-version').textContent = window.SynoUsageBuild?.version
+      ? 'Version ' + window.SynoUsageBuild.version
+      : 'Vorschau';
     statusDisplay();
   }
   function showToast(message) {
@@ -676,63 +889,79 @@
       t.hidden = true;
     }, 4500);
   }
+  const settingFields = {
+    'start-view': 'start',
+    'start-volume': 'startVolume',
+    'chart-mode': 'chart',
+    'free-mode': 'free',
+    'top-count': 'topCount',
+    'group-sort': 'groupSort',
+    'mini-bars': 'mini',
+    subdivide: 'subdivide',
+  };
   function syncSettings() {
-    ['start-view', 'start-volume', 'chart-mode', 'free-mode'].forEach(
-      function (id) {
-        $('#' + id).value =
-          prefs[
-            {
-              'start-view': 'start',
-              'start-volume': 'startVolume',
-              'chart-mode': 'chart',
-              'free-mode': 'free',
-            }[id]
-          ];
-      },
-    );
+    for (const [id, key] of Object.entries(settingFields)) {
+      const field = $('#' + id);
+      if (field.type === 'checkbox') field.checked = !!prefs[key];
+      else field.value = prefs[key];
+    }
     $('#start-volume-label').hidden = prefs.start !== 'volume';
-    $('#mini-bars').checked = !!prefs.mini;
-    $('#subdivide').checked = !!prefs.subdivide;
   }
 
   let demoTask = 'missing';
   let connected = false;
   let pendingUntil = 0;
+  let controlPending = '';
+  let controlRun = '';
   let pendingRun;
   let loading = false;
   let polling = false;
+  let taskStatusRequest = 0;
   const isPreview = location.protocol === 'file:';
   const phases = {
     discover: 'Volumes ermitteln',
     scan: 'Datenpfade messen',
+    retry_pending: 'Zeitlimit erreicht · erneute Messung vorgemerkt',
+    retry: 'Datenpfad erneut messen',
     snapshots: 'Snapshots auswerten',
     docker: 'Docker-Images erfassen',
   };
 
   async function taskStatus() {
+    const requestId = ++taskStatusRequest;
     const label = $('#task-status');
     const fallback = $('#task-script');
-    $('#task-register').hidden = true;
+    const disabledNote = $('#task-disabled-note');
+    disabledNote.hidden = true;
+    $('#task-register').disabled = true;
+    $('#task-register').dataset.available = 'false';
     $('#task-update').hidden = true;
     $('#task-scheduler').hidden = isPreview;
     fallback.hidden = true;
     if (isPreview) {
+      $('#task-update-hint').hidden = true;
       label.textContent =
         demoTask === 'missing'
           ? 'Vorschau · Die Erfassungsaufgabe fehlt.'
           : 'Vorschau · Die Erfassungsaufgabe ist aktuell.';
-      $('#task-register').hidden = demoTask !== 'missing';
+      $('#task-register').dataset.available = String(demoTask === 'missing');
+      $('#task-register').disabled = demoTask !== 'missing';
+      disabledNote.hidden = demoTask !== 'ready';
       return;
     }
     label.textContent = 'Aufgabe wird geprüft …';
     try {
       const scheduler = window.SynoUsageDSM;
       const result = await scheduler.status();
+      if (requestId !== taskStatusRequest) return;
       label.textContent = [result.message, result.schedule]
         .filter(Boolean)
         .join(' · ');
-      $('#task-register').hidden = result.state !== 'missing';
+      disabledNote.hidden = result.scheduleEnabled !== false;
+      $('#task-register').dataset.available = String(result.state === 'missing');
+      $('#task-register').disabled = result.state !== 'missing';
       $('#task-update').hidden = result.state !== 'outdated';
+      $('#task-update-hint').hidden = result.state !== 'outdated';
       if (
         result.state === 'unavailable' ||
         result.state === 'missing' ||
@@ -742,6 +971,7 @@
         fallback.hidden = false;
       }
     } catch (error) {
+      if (requestId !== taskStatusRequest) return;
       if (label.textContent === 'Aufgabe wird geprüft …')
         label.textContent = error.message;
       fallback.hidden = true;
@@ -772,12 +1002,16 @@
       buttons.forEach((button) => {
         button.disabled = false;
       });
+      $('#task-register').disabled = $('#task-register').dataset.available !== 'true';
     }
   }
 
   async function update() {
-    if (busy || data.status?.state === 'running' || pendingUntil > Date.now())
+    if (busy || controlPending || pendingUntil > Date.now()) return;
+    if (data.status?.state === 'running') {
+      if (data.status.canCancel) await controlScan('restart');
       return;
+    }
     if (isPreview) {
       const startedAt = new Date().toISOString();
       data.status = {
@@ -816,6 +1050,27 @@
       await poll();
     } catch (error) {
       showToast(error.message || 'Erfassung fehlgeschlagen.');
+      taskStatus();
+    } finally {
+      busy = false;
+      statusDisplay();
+    }
+  }
+
+  async function controlScan(action) {
+    if (busy || controlPending || !data.status?.canCancel || !data.status.runId) return;
+    const runId = data.status.runId;
+    busy = true;
+    statusDisplay();
+    try {
+      await window.SynoUsageDSM.controlScan(action, runId);
+      controlPending = action;
+      controlRun = runId;
+      showToast(action === 'restart' ? 'Neustart angefordert.' : 'Abbruch angefordert.');
+      await poll();
+    } catch (error) {
+      showToast(error.message || 'Die Aktion ist fehlgeschlagen.');
+      await poll();
     } finally {
       busy = false;
       statusDisplay();
@@ -831,17 +1086,33 @@
         (status.runId && status.runId !== pendingRun))
     )
       pendingUntil = 0;
+    if (controlPending && (status.runId !== controlRun || status.state !== 'running')) controlPending = '';
     const pending = pendingUntil > 0;
     const running = status.state === 'running';
     const failed = status.state === 'failed' && !pending;
-    const title = pending
+    const run = latest();
+    const currentRun = !status.runId || status.runId === run?.id;
+    const warnings = !demo && currentRun ? [...(run?.warnings || [])] : [];
+    const missing = !demo && currentRun ? (run?.items || []).filter((item) =>
+      !item.parentId && item.bytes == null && (item.note || '').includes('Belegung konnte nicht ermittelt werden')
+    ) : [];
+    for (const item of missing) {
+      const message = `${item.path}: ${item.note}`;
+      if (!warnings.includes(message)) warnings.push(message);
+    }
+    const incomplete = !running && !pending && !failed && warnings.length > 0;
+    const title = controlPending
+      ? (controlPending === 'restart' ? 'Neustart angefordert' : 'Abbruch angefordert')
+      : pending
       ? 'Start angefordert'
       : running
         ? 'Erfassung läuft'
         : failed
           ? 'Erfassung fehlgeschlagen'
+          : status.state === 'cancelled'
+            ? 'Erfassung abgebrochen'
           : status.state === 'complete'
-            ? 'Erfassung abgeschlossen'
+            ? (incomplete ? 'Erfassung mit Hinweisen' : 'Erfassung abgeschlossen')
             : isPreview
               ? 'Vorschau'
               : connected
@@ -865,20 +1136,25 @@
         ? 'offline'
         : pending
           ? 'running'
-          : status.state || 'idle';
-    $('#refresh').disabled = busy || pending || running;
+          : incomplete ? 'warning' : status.state || 'idle';
+    $('#refresh').disabled = busy || pending || !!controlPending || (running && !status.canCancel);
+    $('#refresh').textContent = running && status.canCancel ? '↻  Erfassung neu starten' : '↻  Daten aktualisieren';
+    $('#run-cancel').hidden = !(running && status.canCancel);
+    $('#run-cancel').disabled = busy || !!controlPending;
     $('#rail-status').textContent = summary;
     const notice = $('#notice');
     notice.hidden = !(
       running ||
       pending ||
+      !!latest()?.partial ||
       failed ||
+      incomplete ||
       (!isPreview && !connected)
     );
     notice.textContent =
       !isPreview && !connected
         ? 'DSM-Verbindung fehlt. Zuletzt geladener Stand.'
-        : title +
+        : latest()?.partial && !running ? 'Teilergebnis der Erfassung' : incomplete ? `Erfassung unvollständig oder mit Hinweisen · ${warnings.length} ${warnings.length === 1 ? 'Hinweis' : 'Hinweise'} · Status oben öffnen` : title +
           ((running || failed) && summary !== title ? ' · ' + summary : '');
     $('#run-phase').textContent = [
       title,
@@ -892,17 +1168,12 @@
     $('#run-log').textContent =
       (status.log || []).join('\n') ||
       'Bisher sind keine Laufmeldungen vorhanden.';
-    const warnings = demo ? [] : latest()?.warnings || [];
     $('#run-warnings').hidden = warnings.length === 0;
     $('#run-warnings').textContent = warnings.join('\n');
   }
 
   async function request(view = '') {
-    const response = await fetch('./api.cgi' + view, {
-      credentials: 'same-origin',
-      cache: 'no-store',
-      signal: AbortSignal.timeout(12_000),
-    });
+    const response = await window.SynoUsageDSM.cgiRequest(view, 12_000);
     if (!response.ok) throw new Error('HTTP ' + response.status);
     return response.json();
   }
@@ -911,18 +1182,34 @@
     if (isPreview || loading || polling) return;
     polling = true;
     try {
+      const previous = data.status || {};
       const result = await request('?view=status');
       const wasConnected = connected;
       connected = true;
-      data.status = result.status;
-      statusDisplay();
-      if (
-        !wasConnected ||
-        (result.status?.state === 'complete' &&
-          result.status.runId &&
-          result.status.runId !== latest()?.id)
-      )
+      const status = result.status || {};
+      data.status = status;
+      if (!wasConnected ||
+          (status.runId && previous.runId && status.runId !== previous.runId) ||
+          (['complete', 'cancelled', 'failed'].includes(status.state) && status.runId &&
+            (status.runId !== previous.runId || status.state !== previous.state))) {
         await load();
+      } else if (status.checkpoint &&
+          (status.checkpoint !== previous.checkpoint || status.runId !== previous.runId)) {
+        const live = await request('?view=current');
+        data.status = live.status || status;
+        data.user = live.user || data.user;
+        data.current = live.current;
+        if (live.current && demo) {
+          demo = false;
+          data.runs = [];
+          selected = null;
+          dateId = null;
+        }
+        render();
+      } else {
+        if (data.current && status.runId && data.current.id !== status.runId) data.current = undefined;
+        statusDisplay();
+      }
     } catch (_) {
       connected = false;
       statusDisplay();
@@ -941,11 +1228,11 @@
     try {
       const result = await request();
       connected = true;
-      if (demo && result.runs?.length) {
+      if (demo && (result.runs?.length || result.current)) {
         selected = null;
         dateId = null;
       }
-      demo = !result.runs?.length;
+      demo = !result.runs?.length && !result.current;
       data = {
         ...result,
         runs: demo ? window.SynoUsageDemo.runs : result.runs,
@@ -981,6 +1268,11 @@
     $('#settings').showModal();
     taskStatus();
   });
+  $('#task-update-hint').addEventListener('click', function () {
+    syncSettings();
+    $('#settings').showModal();
+    taskStatus();
+  });
   $('#settings-close').addEventListener('click', function () {
     $('#settings').close();
   });
@@ -996,27 +1288,21 @@
   $('#task-scheduler').addEventListener('click', function () {
     taskAction('openScheduler');
   });
-  [
-    ['start-view', 'start'],
-    ['start-volume', 'startVolume'],
-    ['chart-mode', 'chart'],
-    ['free-mode', 'free'],
-    ['mini-bars', 'mini'],
-    ['subdivide', 'subdivide'],
-  ].forEach(function (pair) {
-    $('#' + pair[0]).addEventListener('change', function (e) {
-      prefs[pair[1]] =
-        e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+  for (const [id, key] of Object.entries(settingFields)) {
+    $('#' + id).addEventListener('change', function (e) {
+      prefs[key] = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+      if (key === 'topCount') selected = null;
       save();
       syncSettings();
       render();
     });
-  });
+  }
 
   $('#connection').addEventListener('click', () =>
     $('#run-dialog').showModal(),
   );
   $('#run-close').addEventListener('click', () => $('#run-dialog').close());
+  $('#run-cancel').addEventListener('click', () => controlScan('cancel'));
 
   function choose(el) {
     const choice = el.dataset;
@@ -1096,10 +1382,10 @@
     if (!hovered) return;
     const { item, group } = hovered.dataset;
     content.querySelectorAll(markable).forEach((element) => {
-      const match =
-        item && element.dataset.item
-          ? element.dataset.item === item
-          : element.dataset.group === group;
+      const match = item
+        ? element.dataset.item === item ||
+          (!element.dataset.item && !element.classList.contains('segment') && element.dataset.group === group)
+        : element.dataset.group === group;
       element.classList.toggle('highlight', match);
     });
   });
@@ -1115,5 +1401,6 @@
   });
   render();
   load();
+  taskStatus();
   setInterval(poll, 5000);
 })();

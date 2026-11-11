@@ -121,7 +121,18 @@ def main():
     files = {'INFO':(info,0o644), 'package.tgz':(tgz,0o644), 'PACKAGE_ICON.PNG':(payload['ui/images/icon_64.png'][0],0o644), 'PACKAGE_ICON_256.PNG':(payload['ui/images/icon_256.png'][0],0o644)}
     for folder in ('conf','scripts'):
         for path in sorted((package/folder).rglob('*')):
-            if path.is_file(): files[path.relative_to(package).as_posix()] = (read(path),0o755 if folder == 'scripts' else 0o644)
+            if not path.is_file():
+                continue
+            name = path.relative_to(package).as_posix()
+            contents = read(path)
+            if name == 'scripts/start-stop-status':
+                placeholder = b'__SYNOUSAGE_COLLECTOR_SHA256__'
+                if contents.count(placeholder) != 1:
+                    raise ValueError('Collector checksum placeholder is missing or duplicated')
+                contents = contents.replace(placeholder, binary_hash.encode('ascii'))
+            files[name] = (contents, 0o755 if folder == 'scripts' else 0o644)
+    if not all(name in files for name in ('scripts/preupgrade', 'scripts/postupgrade')):
+        raise ValueError('DSM upgrades require preupgrade and postupgrade scripts')
     spk = dist / f'h5uSynoUsage-{version}-apollolake.spk'; spk.write_bytes(archive(files))
     digest = hashlib.sha256(spk.read_bytes()).hexdigest()
     spk.with_suffix('.spk.sha256').write_text(f'{digest}  {spk.name}\n',encoding='ascii')

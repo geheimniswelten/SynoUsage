@@ -15,8 +15,13 @@
           <h1>SynoUsage</h1>
           <p>Speicherbelegung und Verlauf</p>
         </div>
-        <span id="demo-badge" class="badge demo" hidden>DEMO-DATEN</span
-        ><button
+        <span id="demo-badge" class="badge demo" hidden>DEMO-DATEN</span>
+        <div class="header-meta">
+          <span id="header-stand"></span>
+          <span id="header-version"></span>
+        </div>
+        <button id="task-update-hint" class="connection task-update-hint" type="button" hidden title="Einstellungen zur Aktualisierung der DSM-Aufgabe öffnen">Aufgabe aktualisieren</button>
+        <button
           id="connection"
           class="connection"
           title="Erfassungsstatus öffnen"
@@ -39,7 +44,11 @@
             ><button class="nav" data-page="history">
               <span>◷</span> Verlauf</button
             ><button class="nav" data-page="details">
-              <span>☷</span> Details
+              <span>☷</span> Details</button
+            ><button class="nav" data-page="tasks">
+              <span aria-hidden="true">▥</span> Aufgaben</button
+            ><button class="nav" data-page="info">
+              <span>▤</span> System &amp; Speicher
             </button>
           </nav>
           <div class="rail-bottom">
@@ -56,7 +65,7 @@
               <h2 id="page-title">Speicherübersicht</h2>
               <p id="page-subtitle">Kapazität und größte Speicherposten</p>
             </div>
-            <label class="select-label"
+            <label class="select-label" id="volume-filter-label"
               >Volume
               <select id="volume-filter" aria-label="Volume auswählen"></select
             ></label>
@@ -64,7 +73,6 @@
           <div id="content"></div>
         </main>
       </div>
-      <footer><span>SynoUsage</span><span id="footer-info"></span></footer>
     </div>
     <dialog id="settings">
       <div class="dialog-head">
@@ -96,6 +104,21 @@
             <option value="show">Anzeigen</option>
             <option value="hide">Ausblenden</option>
           </select></label
+        ><label
+          >Angezeigte Speicherposten<select id="top-count">
+            <option value="10">Top 10</option>
+            <option value="20">Top 20</option>
+            <option value="25">Top 25</option>
+            <option value="50">Top 50</option>
+            <option value="100">Top 100</option>
+            <option value="all">Alle</option>
+          </select></label
+        ><label
+          >Gruppen sortieren<select id="group-sort">
+            <option value="rank">Erster Rang</option>
+            <option value="size">Gesamtgröße</option>
+            <option value="count">Anzahl der Einträge</option>
+          </select></label
         ><label class="check"
           ><input type="checkbox" id="mini-bars" /> Kleine Balken in
           Einträgen</label
@@ -113,8 +136,11 @@
         <p id="task-status" class="hint" role="status">
           Aufgabe wird geprüft …
         </p>
+        <p id="task-disabled-note" class="task-disabled-note" hidden>
+          Die regelmäßige Erfassung ist ausgeschaltet. Aktiviere die Aufgabe im DSM-Aufgabenplaner, um automatisch zu erfassen. Manuelle Erfassungen sind weiterhin möglich.
+        </p>
         <div class="button-row">
-          <button id="task-register" class="button secondary" hidden>
+          <button id="task-register" class="button secondary" disabled>
             Aufgabe registrieren</button
           ><button id="task-update" class="button secondary" hidden>
             Aufgabe aktualisieren</button
@@ -154,10 +180,16 @@
       <p id="run-phase" role="status"></p>
       <pre id="run-log"></pre>
       <pre id="run-warnings" hidden></pre>
+      <div class="dialog-actions"><button id="run-cancel" class="button secondary" type="button" hidden>Erfassung abbrechen</button></div>
     </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
     <script defer src="demo.js"></script>
     <script defer src="task-build.js"></script>
+    <script defer src="topology.js"></script>
+    <script defer src="task-time.js"></script>
+    <script defer src="task-sources.js"></script>
+    <script defer src="task-data.js"></script>
+    <script defer src="tasks.js"></script>
     <script defer src="dsm.js"></script>
     <script defer src="app.js"></script>
   </body>

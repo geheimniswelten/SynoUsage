@@ -14,9 +14,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"synousage/internal/collector"
 	"syscall"
 	"time"
+
+	"synousage/internal/collector"
+	"synousage/internal/model"
 )
 
 func ensureRootDir(path string, gid int) error {
@@ -108,6 +110,43 @@ func pruneHistory(dir string) error {
 	return nil
 }
 
+// Upgrade previously recorded root-owned runs to the package's read group.
+func grantHistoryReadAccess(dir string, gid int) error {
+	files, err := runFiles(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range files {
+		name := filepath.Join(dir, entry.Name())
+		fd, err := syscall.Open(name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		f := os.NewFile(uintptr(fd), name)
+		info, err := f.Stat()
+		if err == nil {
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok || !info.Mode().IsRegular() || stat.Uid != 0 || stat.Nlink != 1 {
+				err = fmt.Errorf("unsichere Messdatei: %s", name)
+			}
+		}
+		if err == nil {
+			err = f.Chown(0, gid)
+		}
+		if err == nil {
+			err = f.Chmod(0640)
+		}
+		f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func collectOnDSM(ctx context.Context) error {
 	if os.Geteuid() != 0 {
 		return errors.New("Erfassung als root im DSM-Aufgabenplaner ausführen")
@@ -115,9 +154,9 @@ func collectOnDSM(ctx context.Context) error {
 	if _, err := os.Stat(enabledFile); err != nil {
 		return errors.New("SynoUsage im Paket-Zentrum starten")
 	}
-	group, err := user.LookupGroup("http")
+	group, err := user.LookupGroup("h5uSynoUsage")
 	if err != nil {
-		return fmt.Errorf("DSM-Webgruppe http fehlt: %w", err)
+		return fmt.Errorf("SynoUsage-Paketgruppe fehlt: %w", err)
 	}
 	gid, err := strconv.Atoi(group.Gid)
 	if err != nil {
@@ -137,6 +176,9 @@ func collectOnDSM(ctx context.Context) error {
 	if err := lock.Chown(0, gid); err != nil {
 		return err
 	}
+	if err := lock.Chmod(0640); err != nil {
+		return err
+	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			fmt.Println("Eine SynoUsage-Erfassung läuft bereits.")
@@ -144,23 +186,54 @@ func collectOnDSM(ctx context.Context) error {
 		}
 		return err
 	}
-	log, err := os.OpenFile(filepath.Join(dataDir, "collector.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	if err := grantHistoryReadAccess(runs, gid); err != nil {
+		return fmt.Errorf("Leserechte der Messhistorie: %w", err)
+	}
+	for {
+		restart, err := collectRun(ctx, dataDir, runs, gid, collector.Collect)
+		if err != nil || !restart || ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+func scanLogTimestamp(now, previous time.Time) string {
+	clock := now.Format("15:04:05")
+	if previous.IsZero() {
+		return clock
+	}
+	minutes := strconv.FormatFloat(now.Sub(previous).Minutes(), 'f', 2, 64)
+	minutes = strings.TrimSuffix(strings.TrimRight(minutes, "0"), ".")
+	return clock + " +" + strings.Replace(minutes, ".", ",", 1) + " min"
+}
+
+func collectRun(ctx context.Context, dir, runs string, gid int,
+	measure func(context.Context, func(string, string, int, int), func(model.Run)) (model.Run, error),
+) (bool, error) {
+	log, err := os.OpenFile(filepath.Join(dir, "collector.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer log.Close()
 	if err := log.Chown(0, gid); err != nil {
-		return err
+		return false, err
+	}
+	if err := log.Chmod(0640); err != nil {
+		return false, err
 	}
 	var nonce [6]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
+		return false, err
 	}
 	start := time.Now().UTC()
-	id := start.Format("20060102T150405.000000000") + "-" + hex.EncodeToString(nonce[:])
+	id := start.Format(runStartLayout) + "-" + hex.EncodeToString(nonce[:])
 	status := scanStatus{State: "running", RunID: id, Phase: "Vorbereitung", StartedAt: start.Format(time.RFC3339Nano)}
+	logEscapes := strings.NewReplacer("\r", `\r`, "\n", `\n`)
+	var lastLogAt time.Time
 	logLine := func(message string) {
-		line := time.Now().Format("15:04:05") + "  " + strings.NewReplacer("\r", `\r`, "\n", `\n`).Replace(message)
+		now := time.Now()
+		line := scanLogTimestamp(now, lastLogAt) + "  " + logEscapes.Replace(message)
+		lastLogAt = now
 		fmt.Fprintln(log, line)
 		if len(status.Log) == 20 {
 			status.Log = status.Log[1:]
@@ -169,58 +242,129 @@ func collectOnDSM(ctx context.Context) error {
 	}
 	writeStatus := func() error {
 		status.UpdatedAt = timestamp()
-		return writeAtomicJSON(dataDir, "status.json", status, gid, 256<<10, false)
+		return writeAtomicJSON(dir, "status.json", status, gid, 256<<10, false)
 	}
+
+	runContext, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	closeControl, controlErr := listenScanControl(runContext, dir, gid, id, cancel)
+	defer func() {
+		if closeControl != nil {
+			closeControl()
+		}
+	}()
+	status.CanCancel = controlErr == nil
 	logLine("Erfassung gestartet")
-	if err := writeStatus(); err != nil {
-		return err
+	if controlErr != nil {
+		logLine("Erfassung kann nicht über die App gesteuert werden · " + controlErr.Error())
 	}
-	var statusWriteErr error
+	if err := writeStatus(); err != nil {
+		return false, err
+	}
+	if err := writeAtomicJSON(dir, "hardware.json", collector.HardwareInfo(), gid, 2<<20, true); err != nil {
+		logLine("Hardwareinformationen konnten nicht gespeichert werden · " + err.Error())
+	}
+
+	var statusWriteErr, checkpointErr error
+	updateStatus := func() {
+		if err := writeStatus(); err != nil {
+			statusWriteErr = err
+		}
+	}
+	saveCurrent := func(run model.Run) {
+		if err := writeAtomicJSON(dir, currentFile, run, gid, maxRunBytes, false); err != nil {
+			checkpointErr = err
+			return
+		}
+		status.Checkpoint = run.At.Format(time.RFC3339Nano)
+	}
+
 	lastUpdate := time.Now()
-	run, err := collector.Collect(ctx, func(phase, current string, done, total int) {
-		phaseChanged := phase != status.Phase
+	run, err := measure(runContext, func(phase, current string, done, total int) {
+		stepChanged := phase != status.Phase || current != status.Current
 		status.Phase, status.Current, status.Done, status.Total = phase, current, done, total
-		if phaseChanged || time.Since(lastUpdate) >= time.Second || (total > 0 && done == total) {
+		if stepChanged || time.Since(lastUpdate) >= time.Second || (total > 0 && done == total) {
 			lastUpdate = time.Now()
 			line := phase
 			if current != "" {
 				line += " · " + current
 			}
 			logLine(line)
-			if writeErr := writeStatus(); writeErr != nil {
-				statusWriteErr = writeErr
-			}
+			updateStatus()
+		}
+	}, func(run model.Run) {
+		if len(run.Volumes) > 0 {
+			run.ID, run.At, run.Partial = id, time.Now().UTC(), true
+			saveCurrent(run)
+			updateStatus()
 		}
 	})
-	if err == nil {
-		err = ctx.Err()
+	if closeControl != nil {
+		closeControl()
+		closeControl = nil
 	}
-	if err == nil && len(run.Volumes) == 0 {
-		err = errors.New("Keine Volumes gemessen")
+	status.CanCancel = false
+
+	cause := context.Cause(runContext)
+	restart := errors.Is(cause, errScanRestarted)
+	stopped := restart || errors.Is(cause, errScanCancelled) || errors.Is(cause, context.Canceled)
+	if stopped {
+		err = nil
+	} else if err == nil {
+		err = runContext.Err()
+		if err == nil && len(run.Volumes) == 0 {
+			err = errors.New("Keine Volumes gemessen")
+		}
 	}
-	if err == nil {
-		run.ID = id
-		run.At = time.Now().UTC()
+
+	saved := false
+	if err == nil && len(run.Volumes) > 0 {
+		run.ID, run.At, run.Partial = id, time.Now().UTC(), stopped
 		err = writeAtomicJSON(runs, id+".json", run, gid, maxRunBytes, true)
+		saved = err == nil
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		status.State, status.Message = "failed", err.Error()
 		logLine("Erfassung fehlgeschlagen · " + err.Error())
-	} else {
+	case stopped:
+		status.State, status.Message = "cancelled", errScanCancelled.Error()
+		if restart {
+			status.Message = errScanRestarted.Error()
+		}
+		if saved {
+			saveCurrent(run)
+			status.Message += " · Teilergebnis gespeichert"
+		}
+	default:
 		status.State = "complete"
 		status.Message = fmt.Sprintf("%d Volumes erfasst", len(run.Volumes))
-		if len(run.Warnings) > 0 {
+		if len(run.Warnings) == 1 {
+			status.Message += " · 1 Hinweis"
+		} else if len(run.Warnings) > 1 {
 			status.Message += fmt.Sprintf(" · %d Hinweise", len(run.Warnings))
 		}
-		logLine(status.Message)
+		if removeErr := os.Remove(filepath.Join(dir, currentFile)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			logLine("Zwischenstand konnte nicht aufgeräumt werden · " + removeErr.Error())
+		}
+		status.Checkpoint = ""
+	}
+	for _, warning := range run.Warnings {
+		logLine("Hinweis · " + warning)
+	}
+	logLine(status.Message)
+	if saved {
 		if pruneErr := pruneHistory(runs); pruneErr != nil {
 			logLine("Alte Messstände konnten nicht aufgeräumt werden · " + pruneErr.Error())
 		}
+	}
+	if checkpointErr != nil {
+		logLine("Zwischenstand konnte zeitweise nicht gespeichert werden · " + checkpointErr.Error())
 	}
 	if statusWriteErr != nil {
 		logLine("Live-Status konnte zeitweise nicht gespeichert werden · " + statusWriteErr.Error())
 	}
 	status.Current = ""
 	fmt.Println(status.Message)
-	return errors.Join(err, writeStatus())
+	return restart, errors.Join(err, writeStatus())
 }
