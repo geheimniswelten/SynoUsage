@@ -79,11 +79,26 @@ def preview():
     html = html.replace('assets/synousage.svg', 'data:image/svg+xml;base64,' + svg)
     return html.encode('utf-8')
 
+def generate_icons():
+    """Refresh the checked-in DSM and package icons after an icon design change."""
+    package = ROOT / "package"
+    images = package / "ui" / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    for size in (16, 24, 32, 48, 64, 72, 128, 256):
+        data = icon(size)
+        (images / f"icon_{size}.png").write_bytes(data)
+        if size in (64, 256):
+            (package / ("PACKAGE_ICON.PNG" if size == 64 else "PACKAGE_ICON_256.PNG")).write_bytes(data)
+
+
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument('--go', default='go'); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument('--go', default='go'); parser.add_argument('--icons', action='store_true', help='Regenerate checked-in icons and exit'); args = parser.parse_args()
+    if args.icons:
+        generate_icons()
+        return
     build = ROOT / 'build'; dist = ROOT / 'dist'; build.mkdir(exist_ok=True); dist.mkdir(exist_ok=True)
     exe = build / 'synousage'
-    subprocess.run([args.go, 'build', '-trimpath', '-buildvcs=false', '-ldflags=-s -w', '-o', str(exe), './cmd/synousage'], cwd=ROOT, env=dict(os.environ, GOOS='linux', GOARCH='amd64', CGO_ENABLED='0'), check=True)
+    subprocess.run([args.go, 'build', '-trimpath', '-buildvcs=false', '-ldflags=-s -w', '-o', str(exe), './cmd/synousage'], cwd=ROOT, env=dict(os.environ, GOOS='linux', GOARCH='amd64', GOAMD64='v1', CGO_ENABLED='0'), check=True)
     binary = exe.read_bytes()
     if len(binary) > 16 << 20:
         raise ValueError('The collector exceeds the task script copy limit')
@@ -114,11 +129,13 @@ def main():
     payload['ui/task-build.js'] = (('window.SynoUsageBuild=' + json.dumps({'collectorSHA256':binary_hash, 'version':version}, separators=(',',':')) + ';\n').encode(), 0o644)
     if b'task-build.js' not in payload['ui/index.html'][0]: raise ValueError('index.html must load task-build.js')
     payload['bin/synousage'] = (binary, 0o755); payload['ui/api.cgi'] = (binary, 0o755)
-    for size in (16,24,32,48,64,72,128,256): payload[f'ui/images/icon_{size}.png'] = (icon(size),0o644)
+    for size in (16, 24, 32, 48, 64, 72, 128, 256):
+        if f"ui/images/icon_{size}.png" not in payload:
+            raise ValueError(f"Missing DSM icon: ui/images/icon_{size}.png; regenerate with --icons")
     raw = archive(payload); output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode='wb', mtime=0, filename='', compresslevel=9) as gz: gz.write(raw)
     tgz = output.getvalue(); info += f'checksum="{hashlib.md5(tgz).hexdigest()}"\n'.encode()
-    files = {'INFO':(info,0o644), 'package.tgz':(tgz,0o644), 'PACKAGE_ICON.PNG':(payload['ui/images/icon_64.png'][0],0o644), 'PACKAGE_ICON_256.PNG':(payload['ui/images/icon_256.png'][0],0o644)}
+    files = {'INFO':(info,0o644), 'package.tgz':(tgz,0o644), 'PACKAGE_ICON.PNG':((package/'PACKAGE_ICON.PNG').read_bytes(),0o644), 'PACKAGE_ICON_256.PNG':((package/'PACKAGE_ICON_256.PNG').read_bytes(),0o644)}
     for folder in ('conf','scripts'):
         for path in sorted((package/folder).rglob('*')):
             if not path.is_file():
@@ -133,7 +150,7 @@ def main():
             files[name] = (contents, 0o755 if folder == 'scripts' else 0o644)
     if not all(name in files for name in ('scripts/preupgrade', 'scripts/postupgrade')):
         raise ValueError('DSM upgrades require preupgrade and postupgrade scripts')
-    spk = dist / f'h5uSynoUsage-{version}-apollolake.spk'; spk.write_bytes(archive(files))
+    spk = dist / f'h5uSynoUsage-{version}-x86_64.spk'; spk.write_bytes(archive(files))
     digest = hashlib.sha256(spk.read_bytes()).hexdigest()
     spk.with_suffix('.spk.sha256').write_text(f'{digest}  {spk.name}\n',encoding='ascii')
     (dist/'SynoUsage-Vorschau.html').write_bytes(preview())

@@ -5,6 +5,10 @@ run_collector() {
   export PATH=/usr/syno/bin:/usr/sbin:/usr/bin:/sbin:/bin
   umask 077
   [ "$(id -u)" = 0 ]
+  if [ ! -f "$var/enabled" ]; then
+    echo "SynoUsage ist gestoppt; Erfassung übersprungen."
+    return 0
+  fi
   collector=/var/packages/h5uSynoUsage/target/bin/synousage
   work=$(mktemp -d /var/lib/synousage.XXXXXXXXXX)
   trap 'rm -f -- "$work/synousage"; rmdir -- "$work"' 0

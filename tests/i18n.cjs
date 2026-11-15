@@ -1,0 +1,20 @@
+'use strict';
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const fs = require('node:fs');
+const path = require('node:path');
+const context = {};
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../ui/i18n.js'), 'utf8'), context);
+const {normalizeLanguage, detectLanguage, translate} = context.SynoUsageI18n;
+
+assert.equal(normalizeLanguage('ger'), 'de');
+assert.equal(normalizeLanguage('de-DE'), 'de');
+assert.equal(normalizeLanguage('enu'), 'en');
+assert.equal(detectLanguage({window: {parent: {SYNO: {SDS: {Session: {lang: 'ger'}}}}}, navigator: {language: 'en'}}), 'de');
+assert.equal(detectLanguage({window: {parent: {SYNO: {SDS: {Session: {lang: 'enu'}}}}}, navigator: {language: 'de'}}), 'en');
+assert.equal(detectLanguage({navigator: {language: 'de-DE'}}), 'de');
+assert.equal(detectLanguage({navigator: {language: 'fr'}}), 'en');
+const messages = {de: {hello: 'Hallo {name}'}, en: {hello: 'Hello {name}'}};
+assert.equal(translate(messages, 'en', 'hello', {name: '{name}'}), 'Hello {name}');
+assert.equal(translate(messages, 'de', 'hello', {name: 'Welt'}), 'Hallo Welt');
+console.log('i18n tests passed');

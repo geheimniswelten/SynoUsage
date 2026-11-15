@@ -1,8 +1,14 @@
 # SynoUsage
 
-DSM-App für Speicherbelegung, Verlauf und Messdetails. Die erste Paketversion ist für die DS918+ mit DSM 7.1 und die Paketarchitektur `apollolake` gebaut.
+DSM-App für Speicherbelegung, Verlauf und Messdetails. Das Paket ist für DSM 7.1 und die Paketarchitektur `x86_64` gebaut, einschließlich `apollolake` und Virtual DSM (`kvmx64`).
+
+Eine kurze deutsch- und englischsprachige Beschreibung für Anwender steht unter [.github/README.md](.github/README.md).
 
 ## Vorschau und Paket bauen
+
+Die Paket-Icons liegen neben `package/INFO`, die DSM-Größen unter `package/ui/images/` und werden beim Build unverändert verwendet. Nach einer Änderung der Icon-Zeichenfunktionen in `scripts/build.py` alle Bilder mit `UPDATE_ICONS.cmd` (alternativ `python scripts/build.py --icons`) neu erzeugen und die geänderten PNG-Dateien einchecken.
+
+
 
 `BUILD.cmd` erzeugt in `dist` die eigenständige Browser-Vorschau `SynoUsage-Vorschau.html`, das SPK und seine SHA-256-Datei. Der Build benötigt Go 1.24 oder neuer und Python 3.10 oder neuer. Er verwendet vorhandene Werkzeuge aus dem PATH oder die portablen Werkzeuge aus dem benachbarten SynoWake-Verzeichnis. Mit `-Go` und `-Python` lassen sich eigene Programmpfade angeben.
 
@@ -33,4 +39,4 @@ Nach 15 Minuten pro Datenpfad setzt die Erfassung den ersten Durchgang fort. Am 
 - **Aufgaben** zeigt oben die im Browser hinterlegten wöchentlichen Arbeitszeiten. Darunter stehen gespeicherte DSM-Ausführungsergebnisse und SynoUsage-Erfassungen mit Dauer und Überschneidungen ab fünf Minuten. Für diese und nächste Woche kommen die nächsten DSM-Termine und die Zeitpläne von Antivirus Essential hinzu, soweit das NAS die Daten liefert. Die Antivirus-Historie liest deutsch- und englischsprachige Start- und Endmeldungen. Bei der Datenbereinigung zeigt der Speicher-Manager auch den letzten Abschluss je Pool. Für einen geplanten Start und einen Abschluss ohne Startzeit ist die Laufdauer unbekannt.
 - **System & Speicher** zeigt erkannte Hardware, die Belegung des Root-Dateisystems, Laufwerke und Partitionen sowie deren RAID-, LVM- und Device-Mapper-Beziehungen. Die Übersicht gruppiert Arrays anhand erkannter LVM-Volumengruppen; System- und Swap-Spiegel verbinden dabei keine sonst getrennten Gruppen. Ungeklärte Volume- und Cache-Zuordnungen bleiben offen. Je Volume erscheinen die drei größten erkannten Freigaben und App-Posten. Die Angaben werden bei der Erfassung lesend aus Linux-Systeminformationen und, falls verfügbar, `pvs`, `lvs` und `synopartition --list` ermittelt und separat als letzter Stand gespeichert. Die Synology-Tabelle enthält mögliche Vorlagen und belegt nicht, welches Layout aktiv ist. Laufwerksplätze, Cache-Funktion und RAM-Riegel werden nicht geraten; fehlende Informationen bleiben offen. Nicht partitionierter Platz ist nicht zwangsläufig für einen Speicherpool verfügbar.
 
-Der Prototyp verwendet die native DSM-Sitzung für den Aufgabenplaner und zeigt den Erfassungsstatus im App-Fenster. Der Paketaufbau und die Abläufe sind lokal geprüft. Registrierung und erste Messung auf der DS918+ sind noch zu prüfen.
+Der Prototyp verwendet die native DSM-Sitzung für den Aufgabenplaner und zeigt den Erfassungsstatus im App-Fenster. Installation und Erfassung wurden auf einer DS918+ mit DSM 7.1.1 und 7.2.2 erprobt; auf einem DSM-7.2.2-System war die manuelle Registrierung der Aufgabe erforderlich. Weitere Tests, insbesondere mit Virtual DSM und neueren DSM-Versionen, stehen aus.
