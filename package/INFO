@@ -1,6 +1,6 @@
 package="h5uSynoUsage"
 displayname="SynoUsage"
-version="0.1.0-0037"
+version="0.1.0-0038"
 description="Storage usage overview and history."
 description_ger="Speicherbelegung und Verlauf im Überblick."
 maintainer="himitsu"

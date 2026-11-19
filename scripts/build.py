@@ -125,6 +125,12 @@ def main():
                     data = re.sub(rb'((?:href|src)="[a-zA-Z0-9/_.-]+)"', rb'\1?v=' + stamp + b'"', data)
                 if name == 'ui/SynoUsage.js':
                     data = data.replace(b'__SYNOUSAGE_BUILD__', stamp)
+                if name == 'ui/config':
+                    config = json.loads(data)
+                    for definitions in config.values():
+                        for definition in definitions.values():
+                            definition['version'] = version
+                    data = (json.dumps(config, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
                 payload[name] = (data, 0o644)
     payload['ui/task-build.js'] = (('window.SynoUsageBuild=' + json.dumps({'collectorSHA256':binary_hash, 'version':version}, separators=(',',':')) + ';\n').encode(), 0o644)
     if b'task-build.js' not in payload['ui/index.html'][0]: raise ValueError('index.html must load task-build.js')
